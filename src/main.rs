@@ -30,7 +30,7 @@ struct Protocol {
     expanded: HashSet<PathBuf>,
     selected_file: Option<PathBuf>,
     file_error: Option<String>,
-    editor: Option<Entity<CodeEditor>>,
+    editors: Vec<OpenEditor>,
     creating_instance: Option<String>,
     cloning: Option<String>,
     pending_delete: Option<(String, String)>,
@@ -42,6 +42,11 @@ struct Protocol {
     layouts: HashMap<(String, String), Layout>,
     drag: Option<DragKind>,
     dir_cache: std::cell::RefCell<HashMap<PathBuf, Vec<instance::DirEntry>>>,
+}
+
+struct OpenEditor {
+    path: PathBuf,
+    entity: Entity<CodeEditor>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -90,7 +95,7 @@ impl Protocol {
             expanded: HashSet::new(),
             selected_file: None,
             file_error: None,
-            editor: None,
+            editors: Vec::new(),
             creating_instance: None,
             cloning: None,
             pending_delete: None,
@@ -152,16 +157,23 @@ impl Protocol {
         self.selected_instance = None;
         self.selected_file = None;
         self.file_error = None;
-        self.editor = None;
         self.expanded.clear();
         self.dir_cache.borrow_mut().clear();
     }
 
     fn select_instance(&mut self, name: &str, _cx: &mut Context<Self>) {
         self.selected_instance = Some(name.to_string());
-        self.selected_file = None;
+        // Only clear selected_file if it's not inside the new instance.
+        let inst_dir = self
+            .selected_workspace
+            .as_deref()
+            .map(|ws| instance::instance_dir(ws, name));
+        if let (Some(inst_dir), Some(file)) = (inst_dir, &self.selected_file) {
+            if !file.starts_with(&inst_dir) {
+                self.selected_file = None;
+            }
+        }
         self.file_error = None;
-        self.editor = None;
         self.expanded.clear();
         self.dir_cache.borrow_mut().clear();
     }
@@ -323,25 +335,64 @@ impl Protocol {
     }
 
     fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        // Reuse if already open (preserves cursor / scroll / undo history / unsaved edits).
+        if self.editors.iter().any(|e| e.path == path) {
+            self.file_error = None;
+            self.selected_file = Some(path);
+            self.persist();
+            return;
+        }
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 self.file_error = None;
-                if let Some(editor) = self.editor.as_ref() {
-                    let path_clone = path.clone();
-                    editor.update(cx, |ed, _| ed.replace_with_file(path_clone, text));
-                } else {
-                    let path_clone = path.clone();
-                    self.editor =
-                        Some(cx.new(|cx| CodeEditor::new(path_clone, text, cx)));
-                }
+                let path_for_editor = path.clone();
+                let entity = cx.new(|cx| CodeEditor::new(path_for_editor, text, cx));
+                self.editors.push(OpenEditor {
+                    path: path.clone(),
+                    entity,
+                });
+                self.selected_file = Some(path);
             }
             Err(e) => {
                 self.file_error = Some(format!("{e}"));
-                self.editor = None;
+                self.selected_file = Some(path);
             }
         }
-        self.selected_file = Some(path);
         self.persist();
+    }
+
+    fn close_editor(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some(idx) = self.editors.iter().position(|e| e.path == path) else { return };
+        self.editors.remove(idx);
+        if self.selected_file.as_deref() == Some(path) {
+            // Pick a neighbor in the same instance, preferring the next tab, then the
+            // previous, then None.
+            let inst_dir = self.active_instance_path();
+            let in_instance = |p: &PathBuf| {
+                inst_dir
+                    .as_deref()
+                    .map(|i| p.starts_with(i))
+                    .unwrap_or(true)
+            };
+            let next = self
+                .editors
+                .iter()
+                .skip(idx)
+                .find(|e| in_instance(&e.path))
+                .or_else(|| self.editors.iter().take(idx).rev().find(|e| in_instance(&e.path)));
+            self.selected_file = next.map(|e| e.path.clone());
+            self.file_error = None;
+        }
+        self.persist();
+        cx.notify();
+    }
+
+    fn active_editor_entity(&self) -> Option<Entity<CodeEditor>> {
+        let path = self.selected_file.as_ref()?;
+        self.editors
+            .iter()
+            .find(|e| &e.path == path)
+            .map(|e| e.entity.clone())
     }
 
     fn toggle_dir(&mut self, path: &Path) {
@@ -405,10 +456,11 @@ impl Protocol {
             Ok(()) => {
                 self.refresh_instances(&ws);
                 if self.selected_instance.as_deref() == Some(inst.as_str()) {
+                    let inst_dir = instance::instance_dir(&ws, &inst);
+                    self.editors.retain(|e| !e.path.starts_with(&inst_dir));
                     self.selected_instance = None;
                     self.selected_file = None;
                     self.file_error = None;
-                    self.editor = None;
                 }
                 self.status = format!("deleted {}/{}", ws, inst);
                 self.persist();
@@ -849,50 +901,132 @@ impl Protocol {
 
     fn render_main(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let outer = div().flex().flex_col().flex_1().min_h_0().min_w_0();
-        if let Some(path) = &self.selected_file {
-            let dirty = self
-                .editor
-                .as_ref()
-                .map(|e| e.read(cx).dirty)
-                .unwrap_or(false);
-            let mut header_text =
-                short_path(path, self.active_instance_path().as_deref());
-            if dirty {
-                header_text.push_str(" •");
-            }
-            let header = div()
-                .flex()
-                .items_center()
-                .h(px(32.))
-                .px_3()
-                .bg(theme::titlebar_bg())
-                .border_b_1()
-                .border_color(theme::divider())
-                .text_color(if dirty { theme::accent() } else { theme::text_muted() })
-                .text_size(px(11.5))
-                .child(SharedString::from(header_text));
+        let inst_dir = self.active_instance_path();
+        let tabs: Vec<(PathBuf, bool, bool)> = self
+            .editors
+            .iter()
+            .filter(|e| inst_dir.as_deref().map_or(true, |i| e.path.starts_with(i)))
+            .map(|e| {
+                (
+                    e.path.clone(),
+                    e.entity.read(cx).dirty,
+                    self.selected_file.as_deref() == Some(e.path.as_path()),
+                )
+            })
+            .collect();
 
+        let tab_bar = self.render_tab_bar(&tabs, inst_dir.as_deref(), cx);
+        let body: gpui::AnyElement = if let Some(file) = &self.selected_file {
             if let Some(err) = &self.file_error {
-                return outer.child(header).child(
-                    div()
-                        .p_3()
-                        .text_color(theme::danger())
-                        .child(SharedString::from(format!("could not read: {err}"))),
-                );
+                div()
+                    .p_3()
+                    .text_color(theme::danger())
+                    .child(SharedString::from(format!("could not read: {err}")))
+                    .into_any_element()
+            } else if let Some(editor) = self.active_editor_entity() {
+                let _ = file;
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .child(editor)
+                    .into_any_element()
+            } else {
+                placeholder("no file selected").into_any_element()
             }
-            if let Some(editor) = self.editor.clone() {
-                return outer.child(header).child(editor);
-            }
+        } else {
+            placeholder("no file selected").into_any_element()
+        };
+
+        outer.child(tab_bar).child(body)
+    }
+
+    fn render_tab_bar(
+        &self,
+        tabs: &[(PathBuf, bool, bool)],
+        inst_dir: Option<&Path>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let bar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .h(px(28.))
+            .bg(theme::titlebar_bg())
+            .border_b_1()
+            .border_color(theme::divider())
+            .text_size(px(11.5));
+        if tabs.is_empty() {
+            return bar.child(
+                div()
+                    .px_3()
+                    .text_color(theme::text_dim())
+                    .child("no files open"),
+            );
         }
-        outer.child(
-            div()
-                .flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .text_color(theme::text_muted())
-                .child("no file selected"),
-        )
+        let mut bar = bar;
+        for (path, dirty, active) in tabs {
+            let label_text = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| path.display().to_string());
+            let mut label_str = label_text;
+            if *dirty {
+                label_str.push_str(" •");
+            }
+            let path_for_switch = path.clone();
+            let path_for_close = path.clone();
+            let tab_id: SharedString = format!("editor-tab:{}", path.display()).into();
+            let close_id: SharedString = format!("editor-close:{}", path.display()).into();
+            bar = bar.child(
+                div()
+                    .id(tab_id)
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .h_full()
+                    .px_3()
+                    .gap_2()
+                    .when(*active, |d| d.bg(theme::bg()))
+                    .text_color(if *active {
+                        theme::text_strong()
+                    } else if *dirty {
+                        theme::accent()
+                    } else {
+                        theme::text_muted()
+                    })
+                    .border_r_1()
+                    .border_color(theme::divider())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::row_hover()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.selected_file = Some(path_for_switch.clone());
+                            this.file_error = None;
+                            this.persist();
+                            cx.notify();
+                        }),
+                    )
+                    .child(SharedString::from(label_str))
+                    .child(
+                        div()
+                            .id(close_id)
+                            .text_color(theme::text_dim())
+                            .hover(|s| s.text_color(theme::danger()))
+                            .child("×")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.close_editor(&path_for_close, cx);
+                                }),
+                            ),
+                    ),
+            );
+        }
+        bar
     }
 
     fn render_terminal_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1103,6 +1237,16 @@ fn resize_handle(
         hit.left_0().right_0().top(px(-3.)).h(px(7.))
     };
     outer.child(hit)
+}
+
+fn placeholder(text: &'static str) -> gpui::Div {
+    div()
+        .flex()
+        .flex_1()
+        .items_center()
+        .justify_center()
+        .text_color(theme::text_muted())
+        .child(text)
 }
 
 fn render_cloning_overlay(workspace: &str, instance: &str) -> impl IntoElement {
