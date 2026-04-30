@@ -97,33 +97,3 @@ pub fn read_dir_sorted(path: &Path) -> Vec<DirEntry> {
     entries
 }
 
-pub fn current_branch(repo_dir: &Path) -> Option<String> {
-    let out = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(repo_dir)
-        .output()
-        .ok()?;
-    if !out.status.success() { return None; }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
-}
-
-pub fn is_dirty(repo_dir: &Path) -> Option<bool> {
-    let out = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(repo_dir)
-        .output()
-        .ok()?;
-    if !out.status.success() { return None; }
-    Some(!out.stdout.is_empty())
-}
-
-pub fn find_repo_root(start: &Path) -> Option<PathBuf> {
-    let mut cur = if start.is_dir() { start.to_path_buf() } else { start.parent()?.to_path_buf() };
-    loop {
-        if cur.join(".git").exists() {
-            return Some(cur);
-        }
-        cur = cur.parent()?.to_path_buf();
-    }
-}

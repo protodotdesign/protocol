@@ -42,14 +42,6 @@ struct Protocol {
     layouts: HashMap<(String, String), Layout>,
     drag: Option<DragKind>,
     dir_cache: std::cell::RefCell<HashMap<PathBuf, Vec<instance::DirEntry>>>,
-    git_cache: std::cell::RefCell<HashMap<PathBuf, GitStatus>>,
-}
-
-#[derive(Clone)]
-struct GitStatus {
-    branch: Option<String>,
-    dirty: Option<bool>,
-    fetched_at: std::time::Instant,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -108,7 +100,6 @@ impl Protocol {
             layouts: HashMap::new(),
             drag: None,
             dir_cache: std::cell::RefCell::new(HashMap::new()),
-            git_cache: std::cell::RefCell::new(HashMap::new()),
         };
         for layout in &app_state.layouts {
             let pos = match layout.terminal_panel_pos.as_str() {
@@ -274,54 +265,6 @@ impl Protocol {
         }
     }
 
-    fn git_status_cached(&self, repo: &Path) -> GitStatus {
-        // Pure cache read; never shells out. Background refresh is kicked off elsewhere.
-        self.git_cache
-            .borrow()
-            .get(repo)
-            .cloned()
-            .unwrap_or(GitStatus {
-                branch: None,
-                dirty: None,
-                fetched_at: std::time::Instant::now(),
-            })
-    }
-
-    fn refresh_git_for_selection(&mut self, cx: &mut Context<Self>) {
-        let Some(file) = self.selected_file.clone() else { return };
-        let Some(repo) = instance::find_repo_root(&file) else { return };
-        // Avoid stampedes: skip if a fresh value is already in the cache.
-        if let Some(entry) = self.git_cache.borrow().get(&repo) {
-            if entry.fetched_at.elapsed() < std::time::Duration::from_secs(2) {
-                return;
-            }
-        }
-        let repo_for_task = repo.clone();
-        cx.spawn(async move |this, cx| {
-            let (branch, dirty) = cx
-                .background_executor()
-                .spawn(async move {
-                    let r = repo_for_task;
-                    let b = instance::current_branch(&r);
-                    let d = instance::is_dirty(&r);
-                    (b, d)
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.git_cache.borrow_mut().insert(
-                    repo,
-                    GitStatus {
-                        branch,
-                        dirty,
-                        fetched_at: std::time::Instant::now(),
-                    },
-                );
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
     fn active_terminal_entity(&self) -> Option<gpui::Entity<Terminal>> {
         let key = self.active_instance_key()?;
         let list = self.terminals.get(&key)?;
@@ -399,7 +342,6 @@ impl Protocol {
         }
         self.selected_file = Some(path);
         self.persist();
-        self.refresh_git_for_selection(cx);
     }
 
     fn toggle_dir(&mut self, path: &Path) {
@@ -1105,18 +1047,6 @@ impl Protocol {
     }
 
     fn render_status(&self) -> impl IntoElement {
-        let mut left = String::new();
-        if let Some(file) = &self.selected_file {
-            if let Some(repo) = instance::find_repo_root(file) {
-                let status = self.git_status_cached(&repo);
-                if let Some(branch) = status.branch {
-                    left.push_str(&format!(" {branch}"));
-                }
-                if let Some(dirty) = status.dirty {
-                    left.push_str(if dirty { "  ·  dirty" } else { "  ·  clean" });
-                }
-            }
-        }
         let right: SharedString = if !self.status.is_empty() {
             self.status.clone().into()
         } else {
@@ -1128,13 +1058,12 @@ impl Protocol {
             .items_center()
             .h(px(theme::STATUSBAR_H))
             .px_3()
-            .gap_3()
             .bg(theme::titlebar_bg())
             .border_t_1()
             .border_color(theme::divider())
             .text_size(px(10.5))
             .text_color(theme::text_muted())
-            .child(div().flex_1().child(SharedString::from(left)))
+            .child(div().flex_1())
             .child(div().child(right))
     }
 }
