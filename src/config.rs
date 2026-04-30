@@ -24,6 +24,18 @@ pub struct AppState {
     #[serde(default)]
     pub expanded: Vec<PathBuf>,
     pub selected_file: Option<PathBuf>,
+    #[serde(default)]
+    pub layouts: Vec<InstanceLayout>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstanceLayout {
+    pub workspace: String,
+    pub instance: String,
+    pub left_panel_w: f32,
+    pub terminal_panel_size: f32,
+    /// "bottom" or "right".
+    pub terminal_panel_pos: String,
 }
 
 pub fn protocol_root() -> PathBuf {

@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    App, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton,
-    SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, div, point, prelude::*, px,
-    size,
+    App, Bounds, Context, CursorStyle, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent,
+    MouseButton, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, div, point,
+    prelude::*, px, size,
 };
 use gpui_platform::application;
 
@@ -38,6 +38,50 @@ struct Protocol {
     // Per-(workspace, instance) terminal sessions, kept alive across instance switches.
     terminals: HashMap<(String, String), Vec<gpui::Entity<Terminal>>>,
     active_terminal_idx: HashMap<(String, String), usize>,
+    // Per-instance layout state. Falls back to defaults when no entry exists.
+    layouts: HashMap<(String, String), Layout>,
+    drag: Option<DragKind>,
+    dir_cache: std::cell::RefCell<HashMap<PathBuf, Vec<instance::DirEntry>>>,
+    git_cache: std::cell::RefCell<HashMap<PathBuf, GitStatus>>,
+}
+
+#[derive(Clone)]
+struct GitStatus {
+    branch: Option<String>,
+    dirty: Option<bool>,
+    fetched_at: std::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Layout {
+    left_panel_w: f32,
+    terminal_panel_size: f32,
+    terminal_panel_pos: PanelPos,
+}
+
+impl Default for Layout {
+    fn default() -> Self {
+        Self {
+            left_panel_w: theme::PANEL_W,
+            terminal_panel_size: 280.,
+            terminal_panel_pos: PanelPos::Bottom,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PanelPos {
+    Bottom,
+    Right,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DragKind {
+    LeftPanel,
+    TerminalPanel,
+    /// User is dragging the terminal panel's reposition handle. Tracks the
+    /// current pointer position so we can decide which dock to snap to on drop.
+    TerminalPanelMove,
 }
 
 impl Protocol {
@@ -61,7 +105,25 @@ impl Protocol {
             status: String::new(),
             terminals: HashMap::new(),
             active_terminal_idx: HashMap::new(),
+            layouts: HashMap::new(),
+            drag: None,
+            dir_cache: std::cell::RefCell::new(HashMap::new()),
+            git_cache: std::cell::RefCell::new(HashMap::new()),
         };
+        for layout in &app_state.layouts {
+            let pos = match layout.terminal_panel_pos.as_str() {
+                "right" => PanelPos::Right,
+                _ => PanelPos::Bottom,
+            };
+            this.layouts.insert(
+                (layout.workspace.clone(), layout.instance.clone()),
+                Layout {
+                    left_panel_w: layout.left_panel_w,
+                    terminal_panel_size: layout.terminal_panel_size,
+                    terminal_panel_pos: pos,
+                },
+            );
+        }
         let initial_ws = app_state
             .last_workspace
             .clone()
@@ -101,6 +163,7 @@ impl Protocol {
         self.file_error = None;
         self.editor = None;
         self.expanded.clear();
+        self.dir_cache.borrow_mut().clear();
     }
 
     fn select_instance(&mut self, name: &str, _cx: &mut Context<Self>) {
@@ -109,15 +172,44 @@ impl Protocol {
         self.file_error = None;
         self.editor = None;
         self.expanded.clear();
+        self.dir_cache.borrow_mut().clear();
     }
 
     fn persist(&self) {
+        let layouts: Vec<config::InstanceLayout> = self
+            .layouts
+            .iter()
+            .map(|((ws, inst), l)| config::InstanceLayout {
+                workspace: ws.clone(),
+                instance: inst.clone(),
+                left_panel_w: l.left_panel_w,
+                terminal_panel_size: l.terminal_panel_size,
+                terminal_panel_pos: match l.terminal_panel_pos {
+                    PanelPos::Bottom => "bottom".into(),
+                    PanelPos::Right => "right".into(),
+                },
+            })
+            .collect();
         config::save_app_state(&config::AppState {
             last_workspace: self.selected_workspace.clone(),
             last_instance: self.selected_instance.clone(),
             expanded: self.expanded.iter().cloned().collect(),
             selected_file: self.selected_file.clone(),
+            layouts,
         });
+    }
+
+    fn current_layout(&self) -> Layout {
+        self.active_instance_key()
+            .and_then(|k| self.layouts.get(&k).copied())
+            .unwrap_or_default()
+    }
+
+    fn mutate_layout(&mut self, f: impl FnOnce(&mut Layout)) {
+        let Some(key) = self.active_instance_key() else { return };
+        let entry = self.layouts.entry(key).or_default();
+        f(entry);
+        self.persist();
     }
 
     fn active_workspace(&self) -> Option<&Workspace> {
@@ -182,12 +274,109 @@ impl Protocol {
         }
     }
 
+    fn git_status_cached(&self, repo: &Path) -> GitStatus {
+        // Pure cache read; never shells out. Background refresh is kicked off elsewhere.
+        self.git_cache
+            .borrow()
+            .get(repo)
+            .cloned()
+            .unwrap_or(GitStatus {
+                branch: None,
+                dirty: None,
+                fetched_at: std::time::Instant::now(),
+            })
+    }
+
+    fn refresh_git_for_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(file) = self.selected_file.clone() else { return };
+        let Some(repo) = instance::find_repo_root(&file) else { return };
+        // Avoid stampedes: skip if a fresh value is already in the cache.
+        if let Some(entry) = self.git_cache.borrow().get(&repo) {
+            if entry.fetched_at.elapsed() < std::time::Duration::from_secs(2) {
+                return;
+            }
+        }
+        let repo_for_task = repo.clone();
+        cx.spawn(async move |this, cx| {
+            let (branch, dirty) = cx
+                .background_executor()
+                .spawn(async move {
+                    let r = repo_for_task;
+                    let b = instance::current_branch(&r);
+                    let d = instance::is_dirty(&r);
+                    (b, d)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.git_cache.borrow_mut().insert(
+                    repo,
+                    GitStatus {
+                        branch,
+                        dirty,
+                        fetched_at: std::time::Instant::now(),
+                    },
+                );
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn active_terminal_entity(&self) -> Option<gpui::Entity<Terminal>> {
         let key = self.active_instance_key()?;
         let list = self.terminals.get(&key)?;
         if list.is_empty() { return None; }
         let idx = self.active_terminal_idx.get(&key).copied().unwrap_or(0).min(list.len() - 1);
         list.get(idx).cloned()
+    }
+
+    fn on_global_mouse_move(
+        &mut self,
+        ev: &gpui::MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.drag else { return };
+        let win_size = window.viewport_size();
+        let win_w = win_size.width.as_f32();
+        let win_h = win_size.height.as_f32();
+        let x = ev.position.x.as_f32();
+        let y = ev.position.y.as_f32();
+        let current = self.current_layout();
+        match drag {
+            DragKind::LeftPanel => {
+                let w = x.clamp(140., (win_w - 240.).max(140.));
+                self.mutate_layout(|l| l.left_panel_w = w);
+            }
+            DragKind::TerminalPanel => match current.terminal_panel_pos {
+                PanelPos::Bottom => {
+                    let h = (win_h - y).clamp(80., (win_h - 120.).max(80.));
+                    self.mutate_layout(|l| l.terminal_panel_size = h);
+                }
+                PanelPos::Right => {
+                    let new_w = (win_w - x).clamp(160., (win_w - current.left_panel_w - 200.).max(160.));
+                    self.mutate_layout(|l| l.terminal_panel_size = new_w);
+                }
+            },
+            DragKind::TerminalPanelMove => {
+                let dist_bottom = win_h - y;
+                let dist_right = win_w - x;
+                let pos = if dist_bottom < dist_right { PanelPos::Bottom } else { PanelPos::Right };
+                self.mutate_layout(|l| l.terminal_panel_pos = pos);
+            }
+        }
+        cx.notify();
+    }
+
+    fn on_global_mouse_up(
+        &mut self,
+        _ev: &gpui::MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.drag.take().is_some() {
+            cx.notify();
+        }
     }
 
     fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -210,6 +399,7 @@ impl Protocol {
         }
         self.selected_file = Some(path);
         self.persist();
+        self.refresh_git_for_selection(cx);
     }
 
     fn toggle_dir(&mut self, path: &Path) {
@@ -336,26 +526,21 @@ impl Focusable for Protocol {
 
 impl Render for Protocol {
     fn render(&mut self, _w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let body = div()
-            .flex()
-            .flex_row()
-            .flex_1()
-            .min_h_0()
-            .child(self.render_left(cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
-                    .child(self.render_main(cx))
-                    .child(self.render_terminal_panel(cx)),
-            );
+        let t = std::time::Instant::now();
+        let body = self.render_body(cx);
+        if std::env::var("PROTOCOL_TIMING").is_ok() {
+            let ms = t.elapsed().as_secs_f64() * 1000.;
+            if ms > 0.5 {
+                eprintln!("protocol render_body: {:.2}ms", ms);
+            }
+        }
 
         let mut root = div()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_mouse_move(cx.listener(Self::on_global_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_global_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_global_mouse_up))
             .flex()
             .flex_col()
             .size_full()
@@ -433,15 +618,48 @@ impl Protocol {
             .child(SharedString::from(crumb))
     }
 
+    fn render_body(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let layout = self.current_layout();
+        let center = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .child(self.render_main(cx));
+        let center = if layout.terminal_panel_pos == PanelPos::Bottom {
+            center
+                .child(resize_handle(DragKind::TerminalPanel, false, self.drag, cx))
+                .child(self.render_terminal_panel(cx))
+        } else {
+            center
+        };
+
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h_0()
+            .child(self.render_left(cx))
+            .child(resize_handle(DragKind::LeftPanel, true, self.drag, cx))
+            .child(center);
+        if layout.terminal_panel_pos == PanelPos::Right {
+            row = row
+                .child(resize_handle(DragKind::TerminalPanel, true, self.drag, cx))
+                .child(self.render_terminal_panel(cx));
+        }
+        row
+    }
+
     fn render_left(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let layout = self.current_layout();
         div()
             .flex()
             .flex_col()
-            .w(px(theme::PANEL_W))
-            .h_full()
+            .w(px(layout.left_panel_w))
+            .flex_none()
+            .overflow_hidden()
             .bg(theme::panel_bg())
-            .border_r_1()
-            .border_color(theme::divider())
             .child(self.render_workspaces_section(cx))
             .child(self.render_instances_section(cx))
             .child(self.render_repositories_section(cx))
@@ -480,7 +698,13 @@ impl Protocol {
         rows: &mut Vec<gpui::AnyElement>,
         cx: &mut Context<Self>,
     ) {
-        let entries = instance::read_dir_sorted(dir);
+        let entries = {
+            let mut cache = self.dir_cache.borrow_mut();
+            cache
+                .entry(dir.to_path_buf())
+                .or_insert_with(|| instance::read_dir_sorted(dir))
+                .clone()
+        };
         for entry in entries {
             let DirEntry { name, path, is_dir } = entry;
             let expanded = self.expanded.contains(&path);
@@ -682,7 +906,7 @@ impl Protocol {
     }
 
     fn render_main(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let outer = div().flex().flex_col().flex_1().h_full();
+        let outer = div().flex().flex_col().flex_1().min_h_0().min_w_0();
         if let Some(path) = &self.selected_file {
             let dirty = self
                 .editor
@@ -821,6 +1045,33 @@ impl Protocol {
                     }),
                 ),
         );
+        // Spacer.
+        tabs = tabs.child(div().flex_1());
+        // Dock-position handle: drag to swap between bottom and right docks; click toggles.
+        let dock_label = match self.current_layout().terminal_panel_pos {
+            PanelPos::Bottom => "↧ dock bottom",
+            PanelPos::Right => "↦ dock right",
+        };
+        tabs = tabs.child(
+            div()
+                .id("term-dock")
+                .flex()
+                .items_center()
+                .px_3()
+                .h_full()
+                .text_size(px(11.))
+                .text_color(theme::text_muted())
+                .cursor(CursorStyle::OpenHand)
+                .hover(|s| s.bg(theme::row_hover()).text_color(theme::text()))
+                .child(dock_label)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _ev, _w, cx| {
+                        this.drag = Some(DragKind::TerminalPanelMove);
+                        cx.notify();
+                    }),
+                ),
+        );
 
         let body: gpui::AnyElement = if terminal_count == 0 {
             div()
@@ -844,23 +1095,24 @@ impl Protocol {
             div().flex_1().min_h_0().into_any_element()
         };
 
-        div()
-            .flex()
-            .flex_col()
-            .h(px(280.))
-            .flex_none()
-            .child(tabs)
-            .child(body)
+        let layout = self.current_layout();
+        let outer = div().flex().flex_col().flex_none().overflow_hidden();
+        let outer = match layout.terminal_panel_pos {
+            PanelPos::Bottom => outer.h(px(layout.terminal_panel_size)).w_full(),
+            PanelPos::Right => outer.w(px(layout.terminal_panel_size)),
+        };
+        outer.child(tabs).child(body)
     }
 
     fn render_status(&self) -> impl IntoElement {
         let mut left = String::new();
         if let Some(file) = &self.selected_file {
             if let Some(repo) = instance::find_repo_root(file) {
-                if let Some(branch) = instance::current_branch(&repo) {
+                let status = self.git_status_cached(&repo);
+                if let Some(branch) = status.branch {
                     left.push_str(&format!(" {branch}"));
                 }
-                if let Some(dirty) = instance::is_dirty(&repo) {
+                if let Some(dirty) = status.dirty {
                     left.push_str(if dirty { "  ·  dirty" } else { "  ·  clean" });
                 }
             }
@@ -885,6 +1137,43 @@ impl Protocol {
             .child(div().flex_1().child(SharedString::from(left)))
             .child(div().child(right))
     }
+}
+
+fn resize_handle(
+    kind: DragKind,
+    vertical: bool,
+    current_drag: Option<DragKind>,
+    cx: &mut Context<Protocol>,
+) -> impl IntoElement {
+    let active = current_drag == Some(kind);
+    let cursor = if vertical { CursorStyle::ResizeLeftRight } else { CursorStyle::ResizeUpDown };
+    let bg = if active { theme::accent() } else { theme::divider() };
+
+    // Outer hit region (1px footprint to keep layout flush with the panel) plus an
+    // absolutely positioned wider invisible hit area for easy grabbing.
+    let mut outer = div()
+        .relative()
+        .flex_none()
+        .cursor(cursor)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _ev, _w, cx| {
+                this.drag = Some(kind);
+                cx.notify();
+            }),
+        );
+    outer = if vertical {
+        outer.w(px(1.)).h_full().bg(bg)
+    } else {
+        outer.h(px(1.)).w_full().bg(bg)
+    };
+    let hit = div().absolute();
+    let hit = if vertical {
+        hit.top_0().bottom_0().left(px(-3.)).w(px(7.))
+    } else {
+        hit.left_0().right_0().top(px(-3.)).h(px(7.))
+    };
+    outer.child(hit)
 }
 
 fn render_cloning_overlay(workspace: &str, instance: &str) -> impl IntoElement {
