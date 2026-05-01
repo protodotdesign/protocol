@@ -12,16 +12,20 @@ mod config;
 mod editor;
 mod highlight;
 mod instance;
+mod modals;
 mod terminal;
 mod theme;
+mod ui;
 
 use editor::CodeEditor;
 use terminal::Terminal;
 
 use config::Workspace;
 use instance::{DirEntry, Instance};
+use modals::{render_cloning_overlay, render_delete_modal, render_new_instance_modal};
+use ui::{card_frame, focus_overlay, placeholder, row_base, section_header, sidebar_toggle_button};
 
-struct Protocol {
+pub struct Protocol {
     focus: FocusHandle,
     workspaces: Vec<(Workspace, Option<String>)>,
     instances: HashMap<String, Vec<Instance>>,
@@ -31,9 +35,7 @@ struct Protocol {
     selected_file: Option<PathBuf>,
     file_error: Option<String>,
     editors: Vec<OpenEditor>,
-    creating_instance: Option<String>,
-    cloning: Option<String>,
-    pending_delete: Option<(String, String)>,
+    modal: Modal,
     status: String,
     // Per-(workspace, instance) terminal sessions, kept alive across instance switches.
     terminals: HashMap<(String, String), Vec<gpui::Entity<Terminal>>>,
@@ -43,6 +45,20 @@ struct Protocol {
     drag: Option<DragKind>,
     dir_cache: std::cell::RefCell<HashMap<PathBuf, Vec<instance::DirEntry>>>,
     collapsed_workspaces: HashSet<String>,
+}
+
+/// One-of modal/overlay state. Only one can be active at a time, so a single
+/// enum is the right shape. Add a variant when you add a new modal — the
+/// renderer + key handler match exhaustively.
+pub(crate) enum Modal {
+    None,
+    NewInstance(String),
+    Cloning(String),
+    Delete { ws: String, instance: String },
+}
+
+impl Modal {
+    pub(crate) fn is_new_instance(&self) -> bool { matches!(self, Modal::NewInstance(_)) }
 }
 
 struct OpenEditor {
@@ -104,9 +120,7 @@ impl Protocol {
             selected_file: None,
             file_error: None,
             editors: Vec::new(),
-            creating_instance: None,
-            cloning: None,
-            pending_delete: None,
+            modal: Modal::None,
             status: String::new(),
             terminals: HashMap::new(),
             active_terminal_idx: HashMap::new(),
@@ -423,18 +437,21 @@ impl Protocol {
 
     fn start_create_instance(&mut self) {
         if self.selected_workspace.is_some() {
-            self.creating_instance = Some(String::new());
+            self.modal = Modal::NewInstance(String::new());
         }
     }
 
-    fn finish_create_instance(&mut self, cx: &mut Context<Self>) {
-        let Some(name_raw) = self.creating_instance.take() else { return };
+    pub(crate) fn finish_create_instance(&mut self, cx: &mut Context<Self>) {
+        let name_raw = match std::mem::replace(&mut self.modal, Modal::None) {
+            Modal::NewInstance(s) => s,
+            other => { self.modal = other; return; }
+        };
         let name = name_raw.trim().to_string();
         if name.is_empty() {
             return;
         }
         let Some(ws) = self.active_workspace().cloned() else { return };
-        self.cloning = Some(name.clone());
+        self.modal = Modal::Cloning(name.clone());
         self.status = format!("cloning {}/{}…", ws.name, name);
         cx.notify();
 
@@ -447,7 +464,7 @@ impl Protocol {
                 .spawn(async move { instance::create_instance(&ws_owned, &name_owned) })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.cloning = None;
+                this.modal = Modal::None;
                 match result {
                     Ok(()) => {
                         this.refresh_instances(&ws_name);
@@ -465,12 +482,17 @@ impl Protocol {
         .detach();
     }
 
-    fn cancel_create_instance(&mut self) {
-        self.creating_instance = None;
+    pub(crate) fn cancel_create_instance(&mut self) {
+        if matches!(self.modal, Modal::NewInstance(_)) {
+            self.modal = Modal::None;
+        }
     }
 
-    fn confirm_delete(&mut self, cx: &mut Context<Self>) {
-        let Some((ws, inst)) = self.pending_delete.take() else { return };
+    pub(crate) fn confirm_delete(&mut self, cx: &mut Context<Self>) {
+        let (ws, inst) = match std::mem::replace(&mut self.modal, Modal::None) {
+            Modal::Delete { ws, instance } => (ws, instance),
+            other => { self.modal = other; return; }
+        };
         match instance::delete_instance(&ws, &inst) {
             Ok(()) => {
                 self.refresh_instances(&ws);
@@ -491,44 +513,41 @@ impl Protocol {
         cx.notify();
     }
 
-    fn cancel_delete(&mut self) {
-        self.pending_delete = None;
+    pub(crate) fn cancel_delete(&mut self) {
+        if matches!(self.modal, Modal::Delete { .. }) {
+            self.modal = Modal::None;
+        }
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
-        if self.pending_delete.is_some() {
-            match key {
-                "enter" => self.confirm_delete(cx),
-                "escape" => { self.cancel_delete(); cx.notify(); }
-                _ => {}
-            }
-            return;
-        }
-        if self.creating_instance.is_some() {
-            match key {
-                "enter" => self.finish_create_instance(cx),
-                "escape" => self.cancel_create_instance(),
-                "backspace" => {
-                    if let Some(name) = self.creating_instance.as_mut() {
-                        name.pop();
-                    }
+        match &mut self.modal {
+            Modal::Delete { .. } => {
+                match key {
+                    "enter" => self.confirm_delete(cx),
+                    "escape" => { self.cancel_delete(); cx.notify(); }
+                    _ => {}
                 }
-                _ => {
-                    let push: Option<String> = event
-                        .keystroke
-                        .key_char
-                        .as_deref()
-                        .filter(|c| !c.is_empty() && !c.chars().any(|ch| ch.is_control()))
-                        .map(|c| c.to_string());
-                    if let (Some(text), Some(name)) =
-                        (push, self.creating_instance.as_mut())
-                    {
-                        name.push_str(&text);
+            }
+            Modal::NewInstance(name) => {
+                match key {
+                    "enter" => self.finish_create_instance(cx),
+                    "escape" => { self.cancel_create_instance(); cx.notify(); }
+                    "backspace" => { name.pop(); cx.notify(); }
+                    _ => {
+                        let push = event
+                            .keystroke
+                            .key_char
+                            .as_deref()
+                            .filter(|c| !c.is_empty() && !c.chars().any(|ch| ch.is_control()));
+                        if let Some(text) = push {
+                            name.push_str(text);
+                            cx.notify();
+                        }
                     }
                 }
             }
-            cx.notify();
+            Modal::Cloning(_) | Modal::None => {}
         }
     }
 }
@@ -565,45 +584,22 @@ impl Render for Protocol {
             .child(body)
             .child(self.render_status());
 
-        if let Some((ws, inst)) = self.pending_delete.clone() {
-            root = root.child(render_delete_modal(&ws, &inst, cx));
-        }
-        if let Some(name) = self.creating_instance.clone() {
-            let ws_label = self.selected_workspace.clone().unwrap_or_default();
-            root = root.child(render_new_instance_modal(&ws_label, &name, cx));
-        }
-        if let Some(name) = self.cloning.clone() {
-            let ws_label = self.selected_workspace.clone().unwrap_or_default();
-            root = root.child(render_cloning_overlay(&ws_label, &name));
+        match &self.modal {
+            Modal::None => {}
+            Modal::Delete { ws, instance } => {
+                root = root.child(render_delete_modal(ws, instance, cx));
+            }
+            Modal::NewInstance(name) => {
+                let ws_label = self.selected_workspace.clone().unwrap_or_default();
+                root = root.child(render_new_instance_modal(&ws_label, name, cx));
+            }
+            Modal::Cloning(name) => {
+                let ws_label = self.selected_workspace.clone().unwrap_or_default();
+                root = root.child(render_cloning_overlay(&ws_label, name));
+            }
         }
         root
     }
-}
-
-fn section_header(label: &'static str) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .gap_1()
-        .h(px(theme::SECTION_HEADER_H))
-        .px(px(theme::ROW_PAD_X))
-        .text_size(px(10.))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(theme::text_muted())
-        .child(div().text_size(px(8.5)).text_color(theme::text_dim()).child("▾"))
-        .child(SharedString::from(label.to_string()))
-}
-
-fn row_base() -> gpui::Div {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_1p5()
-        .h(px(theme::ROW_H))
-        .mx(px(4.))
-        .px(px(theme::ROW_PAD_X - 4.))
-        .rounded(px(4.))
 }
 
 impl Protocol {
@@ -892,7 +888,7 @@ impl Protocol {
                     .clone()
             };
             let instance_entries: Vec<_> = entries.into_iter().filter(|e| e.is_dir).collect();
-            if instance_entries.is_empty() && self.creating_instance.is_none() {
+            if instance_entries.is_empty() && !self.modal.is_new_instance() {
                 col = col.child(
                     row_base()
                         .pl(px(theme::ROW_PAD_X + theme::INDENT_PX - 4.))
@@ -954,7 +950,7 @@ impl Protocol {
                         .on_mouse_down(
                             MouseButton::Right,
                             cx.listener(move |this, _, _, cx| {
-                                this.pending_delete = Some((ws_for_right.clone(), inst_for_right.clone()));
+                                this.modal = Modal::Delete { ws: ws_for_right.clone(), instance: inst_for_right.clone() };
                                 cx.notify();
                             }),
                         ),
@@ -1128,7 +1124,7 @@ impl Protocol {
             return col;
         };
         let instances = self.instances_of(&ws).to_vec();
-        if instances.is_empty() && self.creating_instance.is_none() {
+        if instances.is_empty() && !self.modal.is_new_instance() {
             col = col.child(
                 row_base()
                     .text_color(theme::text_dim())
@@ -1170,7 +1166,7 @@ impl Protocol {
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, _, _, cx| {
-                        this.pending_delete = Some((ws_for_right.clone(), name_for_right.clone()));
+                        this.modal = Modal::Delete { ws: ws_for_right.clone(), instance: name_for_right.clone() };
                         cx.notify();
                     }),
                 );
@@ -1531,44 +1527,6 @@ impl Protocol {
     }
 }
 
-/// 1px subtle border + 6px corner radius + 1px inset, with content clipping.
-/// The card paints its own bg matching the editor body's syntect theme bg, so
-/// any antialiased pixels at the rounded corners blend with the card's own
-/// fill instead of bleeding the editor color past the clip.
-fn card_frame() -> gpui::Div {
-    div()
-        .flex()
-        .flex_col()
-        .my(px(1.))
-        .mx(px(1.))
-        .rounded(px(6.))
-        .border_1()
-        .border_color(theme::divider())
-        .bg(highlight::theme_bg())
-        .overflow_hidden()
-}
-
-fn sidebar_toggle_button(
-    id: &'static str,
-    glyph: &'static str,
-    handler: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .justify_center()
-        .w(px(24.))
-        .h(px(22.))
-        .rounded(px(4.))
-        .text_size(px(11.))
-        .text_color(theme::text_muted())
-        .cursor_pointer()
-        .hover(|s| s.bg(theme::row_hover()).text_color(theme::text()))
-        .on_mouse_down(MouseButton::Left, handler)
-        .child(glyph)
-}
-
 fn resize_handle(
     kind: DragKind,
     vertical: bool,
@@ -1616,245 +1574,6 @@ fn resize_handle(
         wrapper = wrapper.child(stroke);
     }
     wrapper
-}
-
-/// 1px accent ring drawn as an absolutely-positioned overlay so it doesn't
-/// reserve any layout space when not present.
-fn focus_overlay() -> gpui::Div {
-    div()
-        .absolute()
-        .top_0()
-        .left_0()
-        .right_0()
-        .bottom_0()
-        .border_1()
-        .border_color(gpui::hsla(220. / 360., 0.6, 0.6, 0.25))
-}
-
-fn placeholder(text: &'static str) -> gpui::Div {
-    div()
-        .flex()
-        .flex_1()
-        .items_center()
-        .justify_center()
-        .text_color(theme::text_muted())
-        .child(text)
-}
-
-fn render_cloning_overlay(workspace: &str, instance: &str) -> impl IntoElement {
-    let title = SharedString::from(format!("Cloning {workspace} / {instance}"));
-    let hint = SharedString::from(
-        "Running git clone for each repo in the workspace. The window will update when finished.",
-    );
-    div()
-        .absolute()
-        .top_0()
-        .left_0()
-        .size_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(gpui::hsla(0., 0., 0., 0.55))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .w(px(420.))
-                .p_5()
-                .bg(theme::panel_bg())
-                .border_1()
-                .border_color(theme::divider())
-                .rounded(px(6.))
-                .child(div().text_color(theme::text_strong()).child(title))
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(theme::text_muted())
-                        .child(hint),
-                ),
-        )
-}
-
-fn render_new_instance_modal(
-    workspace: &str,
-    name: &str,
-    cx: &mut Context<Protocol>,
-) -> impl IntoElement {
-    let title = SharedString::from(format!("New instance in workspace \"{workspace}\""));
-    let hint = SharedString::from("Enter a name. This will git-clone every repo in the workspace into a new directory. Press Enter to create, Esc to cancel.");
-    let display: SharedString = if name.is_empty() {
-        "type a name…".into()
-    } else {
-        format!("{name}▏").into()
-    };
-    let muted = name.is_empty();
-    div()
-        .absolute()
-        .top_0()
-        .left_0()
-        .size_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(gpui::hsla(0., 0., 0., 0.5))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .w(px(480.))
-                .p_5()
-                .bg(theme::panel_bg())
-                .border_1()
-                .border_color(theme::divider())
-                .rounded(px(6.))
-                .child(div().text_color(theme::text_strong()).child(title))
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(theme::text_muted())
-                        .child(hint),
-                )
-                .child(
-                    div()
-                        .h(px(36.))
-                        .px_3()
-                        .flex()
-                        .items_center()
-                        .bg(theme::bg())
-                        .border_1()
-                        .border_color(theme::divider())
-                        .rounded(px(4.))
-                        .text_color(if muted { theme::text_dim() } else { theme::text_strong() })
-                        .font_family("Menlo")
-                        .child(display),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap_2()
-                        .justify_end()
-                        .child(
-                            div()
-                                .id("new-cancel")
-                                .px_3()
-                                .py_1()
-                                .rounded(px(4.))
-                                .bg(theme::bg())
-                                .border_1()
-                                .border_color(theme::divider())
-                                .cursor_pointer()
-                                .hover(|s| s.bg(theme::row_hover()))
-                                .child("Cancel")
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.cancel_create_instance();
-                                        cx.notify();
-                                    }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id("new-create")
-                                .px_3()
-                                .py_1()
-                                .rounded(px(4.))
-                                .bg(theme::accent())
-                                .text_color(gpui::black())
-                                .cursor_pointer()
-                                .child("Create")
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.finish_create_instance(cx);
-                                        cx.notify();
-                                    }),
-                                ),
-                        ),
-                ),
-        )
-}
-
-fn render_delete_modal(workspace: &str, instance: &str, cx: &mut Context<Protocol>) -> impl IntoElement {
-    let msg = SharedString::from(format!("Delete instance \"{}/{}\"?", workspace, instance));
-    let hint = SharedString::from("This removes the entire directory. Press Enter to confirm, Esc to cancel.");
-    div()
-        .absolute()
-        .top_0()
-        .left_0()
-        .size_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(gpui::hsla(0., 0., 0., 0.5))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .w(px(420.))
-                .p_5()
-                .bg(theme::panel_bg())
-                .border_1()
-                .border_color(theme::divider())
-                .rounded(px(6.))
-                .child(div().text_color(theme::text()).child(msg))
-                .child(div().text_size(px(11.)).text_color(theme::text_muted()).child(hint))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap_2()
-                        .justify_end()
-                        .child(
-                            div()
-                                .px_3()
-                                .py_1()
-                                .rounded(px(4.))
-                                .bg(theme::bg())
-                                .border_1()
-                                .border_color(theme::divider())
-                                .cursor_pointer()
-                                .hover(|s| s.bg(theme::row_hover()))
-                                .child("Cancel")
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.cancel_delete();
-                                        cx.notify();
-                                    }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .px_3()
-                                .py_1()
-                                .rounded(px(4.))
-                                .bg(theme::danger())
-                                .text_color(gpui::white())
-                                .cursor_pointer()
-                                .child("Delete")
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.confirm_delete(cx);
-                                    }),
-                                ),
-                        ),
-                ),
-        )
-}
-
-fn short_path(path: &Path, root: Option<&Path>) -> String {
-    if let Some(root) = root {
-        if let Ok(rel) = path.strip_prefix(root) {
-            return rel.display().to_string();
-        }
-    }
-    path.display().to_string()
 }
 
 fn main() {
