@@ -42,6 +42,7 @@ struct Protocol {
     layouts: HashMap<(String, String), Layout>,
     drag: Option<DragKind>,
     dir_cache: std::cell::RefCell<HashMap<PathBuf, Vec<instance::DirEntry>>>,
+    collapsed_workspaces: HashSet<String>,
 }
 
 struct OpenEditor {
@@ -105,6 +106,7 @@ impl Protocol {
             layouts: HashMap::new(),
             drag: None,
             dir_cache: std::cell::RefCell::new(HashMap::new()),
+            collapsed_workspaces: HashSet::new(),
         };
         for layout in &app_state.layouts {
             let pos = match layout.terminal_panel_pos.as_str() {
@@ -657,35 +659,7 @@ impl Protocol {
 
     fn render_workspace_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut col = div().flex().flex_col().pb_2();
-
-        // Workspace header — click cycles to the next workspace.
-        let header_label: SharedString = match self.selected_workspace.as_deref() {
-            Some(ws) => format!("[ {ws} ]").into(),
-            None => "[ no workspace ]".into(),
-        };
-        col = col.child(
-            div()
-                .id("workspace-header")
-                .flex()
-                .items_center()
-                .h(px(theme::SECTION_HEADER_H))
-                .px(px(theme::ROW_PAD_X))
-                .text_size(px(11.))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(theme::text_strong())
-                .cursor_pointer()
-                .hover(|s| s.bg(theme::row_hover()))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.cycle_workspace(cx);
-                        cx.notify();
-                    }),
-                )
-                .child(header_label),
-        );
-
-        let Some(ws_name) = self.selected_workspace.clone() else {
+        if self.workspaces.is_empty() {
             col = col.child(
                 row_base()
                     .text_color(theme::text_dim())
@@ -695,123 +669,192 @@ impl Protocol {
                     ))),
             );
             return col;
-        };
-
-        // Instances of this workspace, then their repos and files (lazy-expand).
-        let inst_root = config::instances_dir().join(&ws_name);
-        let entries = {
-            let mut cache = self.dir_cache.borrow_mut();
-            cache
-                .entry(inst_root.clone())
-                .or_insert_with(|| instance::read_dir_sorted(&inst_root))
-                .clone()
-        };
-        let instance_entries: Vec<_> = entries.into_iter().filter(|e| e.is_dir).collect();
-
-        if instance_entries.is_empty() && self.creating_instance.is_none() {
-            col = col.child(
-                row_base()
-                    .text_color(theme::text_dim())
-                    .child("no instances"),
-            );
         }
-
-        for inst in &instance_entries {
-            let inst_name = inst.name.clone();
-            let inst_path = inst.path.clone();
-            let active = self.selected_instance.as_deref() == Some(inst_name.as_str());
-            let expanded = self.expanded.contains(&inst_path);
-            let chevron = if expanded { "▾" } else { "▸" };
-            let ws_for_right = ws_name.clone();
-            let inst_for_right = inst_name.clone();
-            let inst_for_click = inst_name.clone();
-            let inst_path_for_click = inst_path.clone();
+        for (w, _err) in &self.workspaces {
+            let ws_name = w.name.clone();
+            let collapsed = self.collapsed_workspaces.contains(&ws_name);
+            let header_chevron = if collapsed { "▸" } else { "▾" };
+            let ws_name_for_toggle = ws_name.clone();
+            // Workspace header: chevron + bracketed name. Click toggles collapse.
+            let ws_name_for_new = ws_name.clone();
             col = col.child(
-                row_base()
-                    .when(active, |d| d.bg(theme::row_selected()))
-                    .hover(|s| s.bg(theme::row_hover()))
-                    .cursor_pointer()
+                div()
+                    .id(SharedString::from(format!("ws-header:{}", ws_name)))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .h(px(theme::SECTION_HEADER_H + 4.))
+                    .px(px(theme::ROW_PAD_X))
+                    .text_size(px(12.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme::text_strong())
+                    // Title + chevron toggle the workspace; "+" button on the right
+                    // creates a new instance.
                     .child(
                         div()
-                            .w(px(12.))
-                            .text_size(px(9.))
-                            .text_color(theme::text_dim())
-                            .child(chevron),
+                            .id(SharedString::from(format!("ws-toggle:{}", ws_name)))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .px_1()
+                            .py_1()
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::row_hover()))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    if this.collapsed_workspaces.contains(&ws_name_for_toggle) {
+                                        this.collapsed_workspaces.remove(&ws_name_for_toggle);
+                                    } else {
+                                        this.collapsed_workspaces
+                                            .insert(ws_name_for_toggle.clone());
+                                    }
+                                    cx.notify();
+                                }),
+                            )
+                            .child(SharedString::from(format!("[ {ws_name} ]")))
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(theme::text_dim())
+                                    .child(header_chevron),
+                            ),
                     )
+                    .child(div().flex_1())
                     .child(
                         div()
-                            .flex_1()
-                            .text_color(if active { theme::text_strong() } else { theme::text() })
-                            .child(SharedString::from(inst_name.clone())),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.select_instance(&inst_for_click, cx);
-                            this.toggle_dir(&inst_path_for_click);
-                            this.persist();
-                            cx.notify();
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, _, _, cx| {
-                            this.pending_delete = Some((ws_for_right.clone(), inst_for_right.clone()));
-                            cx.notify();
-                        }),
+                            .id(SharedString::from(format!("ws-new:{}", ws_name)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(22.))
+                            .h(px(22.))
+                            .rounded(px(4.))
+                            .text_size(px(15.))
+                            .text_color(theme::text_muted())
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::row_hover()).text_color(theme::text()))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    if this.selected_workspace.as_deref()
+                                        != Some(ws_name_for_new.as_str())
+                                    {
+                                        this.select_workspace(&ws_name_for_new, cx);
+                                    }
+                                    this.start_create_instance();
+                                    cx.notify();
+                                }),
+                            )
+                            .child("+"),
                     ),
             );
-            if expanded {
-                let mut sub_rows: Vec<gpui::AnyElement> = Vec::new();
-                self.collect_tree(&inst_path, 1, &mut sub_rows, cx);
-                for r in sub_rows {
-                    col = col.child(r);
+            if collapsed {
+                continue;
+            }
+
+            // Instances of this workspace.
+            let inst_root = config::instances_dir().join(&ws_name);
+            let entries = {
+                let mut cache = self.dir_cache.borrow_mut();
+                cache
+                    .entry(inst_root.clone())
+                    .or_insert_with(|| instance::read_dir_sorted(&inst_root))
+                    .clone()
+            };
+            let instance_entries: Vec<_> = entries.into_iter().filter(|e| e.is_dir).collect();
+            if instance_entries.is_empty() && self.creating_instance.is_none() {
+                col = col.child(
+                    row_base()
+                        .pl(px(theme::ROW_PAD_X + theme::INDENT_PX - 4.))
+                        .text_color(theme::text_dim())
+                        .child("no instances"),
+                );
+            }
+            for inst in &instance_entries {
+                let inst_name = inst.name.clone();
+                let inst_path = inst.path.clone();
+                let active = self.selected_workspace.as_deref() == Some(ws_name.as_str())
+                    && self.selected_instance.as_deref() == Some(inst_name.as_str());
+                let expanded = self.expanded.contains(&inst_path);
+                let chevron = if expanded { "▾" } else { "▸" };
+                let ws_for_select = ws_name.clone();
+                let ws_for_right = ws_name.clone();
+                let inst_for_right = inst_name.clone();
+                let inst_for_click = inst_name.clone();
+                let inst_path_for_click = inst_path.clone();
+                col = col.child(
+                    // Top-level instance entries get their own visual tier: tall card
+                    // with generous vertical padding and a heavier label, distinct from
+                    // the dense file/repo rows underneath. Active gets a subtle 1px
+                    // accent border to highlight the rounded card.
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .h(px(48.))
+                        .mx(px(4.))
+                        .my(px(2.))
+                        .px(px(theme::INDENT_PX))
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(if active {
+                            gpui::hsla(220. / 360., 0.6, 0.6, 0.35)
+                        } else {
+                            gpui::hsla(0., 0., 0., 0.)
+                        })
+                        .text_size(px(14.))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .when(active, |d| d.bg(theme::row_selected()))
+                        .hover(|s| s.bg(theme::row_hover()))
+                        .cursor_pointer()
+                        .child(
+                            div()
+                                .w(px(12.))
+                                .text_size(px(9.5))
+                                .text_color(theme::text_dim())
+                                .child(chevron),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_color(if active { theme::text_strong() } else { theme::text() })
+                                .child(SharedString::from(inst_name.clone())),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                if this.selected_workspace.as_deref() != Some(ws_for_select.as_str()) {
+                                    this.select_workspace(&ws_for_select, cx);
+                                }
+                                this.select_instance(&inst_for_click, cx);
+                                this.toggle_dir(&inst_path_for_click);
+                                this.persist();
+                                cx.notify();
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, _, _, cx| {
+                                this.pending_delete = Some((ws_for_right.clone(), inst_for_right.clone()));
+                                cx.notify();
+                            }),
+                        ),
+                );
+                if expanded {
+                    let mut sub_rows: Vec<gpui::AnyElement> = Vec::new();
+                    self.collect_tree(&inst_path, 2, &mut sub_rows, cx);
+                    for r in sub_rows {
+                        col = col.child(r);
+                    }
                 }
             }
-        }
 
-        // New-instance row.
-        col = col.child(
-            row_base()
-                .id("new-instance-button")
-                .hover(|s| s.bg(theme::row_hover()))
-                .cursor_pointer()
-                .child(
-                    div()
-                        .w(px(12.))
-                        .text_color(theme::text_dim())
-                        .child("+"),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .text_color(theme::text_dim())
-                        .child("new instance"),
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.start_create_instance();
-                        cx.notify();
-                    }),
-                ),
-        );
+        }
         col
-    }
-
-    fn cycle_workspace(&mut self, cx: &mut Context<Self>) {
-        if self.workspaces.len() < 2 {
-            return;
-        }
-        let cur = self.selected_workspace.clone();
-        let names: Vec<String> = self.workspaces.iter().map(|(w, _)| w.name.clone()).collect();
-        let next_idx = match cur.and_then(|c| names.iter().position(|n| n == &c)) {
-            Some(i) => (i + 1) % names.len(),
-            None => 0,
-        };
-        let next = names[next_idx].clone();
-        self.select_workspace(&next, cx);
-        self.persist();
     }
 
     fn render_repositories_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
