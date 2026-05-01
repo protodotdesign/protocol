@@ -17,7 +17,7 @@ mod terminal;
 mod theme;
 mod ui;
 
-use editor::CodeEditor;
+use editor::{CodeEditor, CodeEditorEvent};
 use terminal::Terminal;
 
 use config::Workspace;
@@ -27,7 +27,7 @@ use ui::{card_frame, focus_overlay, placeholder, row_base, section_header, sideb
 
 pub struct Protocol {
     focus: FocusHandle,
-    workspaces: Vec<(Workspace, Option<String>)>,
+    workspaces: Vec<(Workspace, PathBuf, Option<String>)>,
     instances: HashMap<String, Vec<Instance>>,
     selected_workspace: Option<String>,
     selected_instance: Option<String>,
@@ -149,8 +149,8 @@ impl Protocol {
         let initial_ws = app_state
             .last_workspace
             .clone()
-            .filter(|n| this.workspaces.iter().any(|(w, _)| &w.name == n))
-            .or_else(|| this.workspaces.first().map(|(w, _)| w.name.clone()));
+            .filter(|n| this.workspaces.iter().any(|(w, _, _)| &w.name == n))
+            .or_else(|| this.workspaces.first().map(|(w, _, _)| w.name.clone()));
         if let Some(name) = initial_ws {
             this.select_workspace(&name, cx);
             if let Some(inst) = app_state.last_instance.clone() {
@@ -246,7 +246,7 @@ impl Protocol {
 
     fn active_workspace(&self) -> Option<&Workspace> {
         let name = self.selected_workspace.as_deref()?;
-        self.workspaces.iter().find(|(w, _)| w.name == name).map(|(w, _)| w)
+        self.workspaces.iter().find(|(w, _, _)| w.name == name).map(|(w, _, _)| w)
     }
 
     fn active_instance_path(&self) -> Option<PathBuf> {
@@ -380,6 +380,16 @@ impl Protocol {
                 self.file_error = None;
                 let path_for_editor = path.clone();
                 let entity = cx.new(|cx| CodeEditor::new(path_for_editor, text, cx));
+                // If this is a workspace TOML, refresh the workspace list on save
+                // so the sidebar reflects renames/edits.
+                if path.starts_with(config::workspaces_dir()) {
+                    cx.subscribe(&entity, |this, _editor, event, cx| {
+                        let CodeEditorEvent::Saved = event;
+                        this.workspaces = config::load_workspaces();
+                        cx.notify();
+                    })
+                    .detach();
+                }
                 self.editors.push(OpenEditor {
                     path: path.clone(),
                     entity,
@@ -433,6 +443,21 @@ impl Protocol {
             self.expanded.remove(path);
         }
         self.persist();
+    }
+
+    /// Create a blank workspace TOML, refresh the in-memory workspace list,
+    /// and open the new file in the editor so the user can fill it in.
+    pub(crate) fn create_workspace(&mut self, cx: &mut Context<Self>) {
+        match config::create_blank_workspace() {
+            Ok(path) => {
+                self.workspaces = config::load_workspaces();
+                self.open_file(path, cx);
+                self.status = "created blank workspace — edit and save".into();
+            }
+            Err(e) => {
+                self.status = format!("create workspace failed: {e:#}");
+            }
+        }
     }
 
     fn start_create_instance(&mut self) {
@@ -782,24 +807,64 @@ impl Protocol {
 
     fn render_workspace_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut col = div().flex().flex_col().pb_2();
+        // Top header row: "WORKSPACES" label + "+" to create a blank workspace.
+        // Always present, even when the list is empty, so first-time users have
+        // an obvious entry point.
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .h(px(theme::SECTION_HEADER_H))
+                .px(px(theme::ROW_PAD_X))
+                .text_size(px(10.))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme::text_muted())
+                .child(SharedString::from("WORKSPACES"))
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .id("ws-new")
+                        .w(px(20.))
+                        .h(px(20.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(4.))
+                        .text_size(px(13.))
+                        .text_color(theme::text_dim())
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::row_hover()).text_color(theme::text()))
+                        .child("+")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.create_workspace(cx);
+                                cx.notify();
+                            }),
+                        ),
+                ),
+        );
         if self.workspaces.is_empty() {
             col = col.child(
                 row_base()
                     .text_color(theme::text_dim())
                     .child(SharedString::from(format!(
-                        "drop a .toml in {}",
+                        "drop a .toml in {} or click +",
                         config::workspaces_dir().display()
                     ))),
             );
             return col;
         }
-        for (w, _err) in &self.workspaces {
+        for (w, ws_path, _err) in &self.workspaces {
             let ws_name = w.name.clone();
             let collapsed = self.collapsed_workspaces.contains(&ws_name);
             let header_chevron = if collapsed { "▸" } else { "▾" };
             let ws_name_for_toggle = ws_name.clone();
-            // Workspace header: chevron + bracketed name. Click toggles collapse.
             let ws_name_for_new = ws_name.clone();
+            let ws_path_for_edit = ws_path.clone();
+            // Whole-row hover + click toggles collapse; gear/+ buttons sit on
+            // the right and stop propagation so they don't also toggle.
             col = col.child(
                 div()
                     .id(SharedString::from(format!("ws-header:{}", ws_name)))
@@ -808,44 +873,57 @@ impl Protocol {
                     .gap_1()
                     .h(px(theme::SECTION_HEADER_H + 4.))
                     .px(px(theme::ROW_PAD_X))
+                    .mx(px(4.))
+                    .px_1()
+                    .rounded(px(4.))
                     .text_size(px(12.))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme::text_strong())
-                    // Title + chevron toggle the workspace; "+" button on the right
-                    // creates a new instance.
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::row_hover()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            if this.collapsed_workspaces.contains(&ws_name_for_toggle) {
+                                this.collapsed_workspaces.remove(&ws_name_for_toggle);
+                            } else {
+                                this.collapsed_workspaces
+                                    .insert(ws_name_for_toggle.clone());
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .child(SharedString::from(format!("[ {ws_name} ]")))
                     .child(
                         div()
-                            .id(SharedString::from(format!("ws-toggle:{}", ws_name)))
+                            .text_size(px(13.))
+                            .text_color(theme::text_dim())
+                            .child(header_chevron),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("ws-edit:{}", ws_name)))
                             .flex()
-                            .flex_row()
                             .items_center()
-                            .gap_1()
-                            .px_1()
-                            .py_1()
+                            .justify_center()
+                            .w(px(22.))
+                            .h(px(22.))
                             .rounded(px(4.))
+                            .text_size(px(12.))
+                            .text_color(theme::text_muted())
                             .cursor_pointer()
-                            .hover(|s| s.bg(theme::row_hover()))
+                            .hover(|s| s.bg(theme::row_hover()).text_color(theme::text()))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
-                                    if this.collapsed_workspaces.contains(&ws_name_for_toggle) {
-                                        this.collapsed_workspaces.remove(&ws_name_for_toggle);
-                                    } else {
-                                        this.collapsed_workspaces
-                                            .insert(ws_name_for_toggle.clone());
-                                    }
+                                    cx.stop_propagation();
+                                    this.open_file(ws_path_for_edit.clone(), cx);
                                     cx.notify();
                                 }),
                             )
-                            .child(SharedString::from(format!("[ {ws_name} ]")))
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .text_color(theme::text_dim())
-                                    .child(header_chevron),
-                            ),
+                            .child("⚙"),
                     )
-                    .child(div().flex_1())
                     .child(
                         div()
                             .id(SharedString::from(format!("ws-new:{}", ws_name)))
@@ -862,6 +940,7 @@ impl Protocol {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
                                     if this.selected_workspace.as_deref()
                                         != Some(ws_name_for_new.as_str())
                                     {
@@ -1062,7 +1141,7 @@ impl Protocol {
             );
             return col;
         }
-        for (w, err) in &self.workspaces {
+        for (w, _ws_path, err) in &self.workspaces {
             let active = self.selected_workspace.as_deref() == Some(w.name.as_str());
             let name = w.name.clone();
             let row = row_base()
@@ -1217,7 +1296,17 @@ impl Protocol {
         let tabs: Vec<(PathBuf, bool, bool)> = self
             .editors
             .iter()
-            .filter(|e| inst_dir.as_deref().map_or(true, |i| e.path.starts_with(i)))
+            .filter(|e| {
+                // Include tabs that belong to the active instance, plus any
+                // "global" tab living under ~/.protocol/workspaces (workspace
+                // TOML editing). Workspace TOMLs aren't tied to an instance
+                // and should show regardless.
+                let in_instance = inst_dir
+                    .as_deref()
+                    .map_or(true, |i| e.path.starts_with(i));
+                let is_workspace_toml = e.path.starts_with(config::workspaces_dir());
+                in_instance || is_workspace_toml
+            })
             .map(|e| {
                 (
                     e.path.clone(),

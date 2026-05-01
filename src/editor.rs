@@ -4,10 +4,10 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Context, Element, ElementInputHandler,
-    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InspectorElementId, IntoElement,
-    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, SharedString, ShapedLine, Style, TextRun, UTF16Selection, Window, div, fill, font, hsla,
-    point, prelude::*, px, relative,
+    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, InspectorElementId,
+    IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Point, SharedString, ShapedLine, Style, TextRun, UTF16Selection, Window, div, fill,
+    font, hsla, point, prelude::*, px, relative,
 };
 
 use crate::highlight;
@@ -32,6 +32,11 @@ struct Snapshot {
     text: String,
     cursor: usize,
     anchor: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum CodeEditorEvent {
+    Saved,
 }
 
 pub struct CodeEditor {
@@ -172,11 +177,12 @@ impl CodeEditor {
         self.path.extension().and_then(|s| s.to_str())
     }
 
-    fn save(&mut self) {
+    fn save(&mut self, cx: &mut Context<Self>) {
         match std::fs::write(&self.path, &self.text) {
             Ok(()) => {
                 self.dirty = false;
                 self.status = "saved".into();
+                cx.emit(CodeEditorEvent::Saved);
             }
             Err(e) => {
                 self.status = format!("save failed: {e}");
@@ -531,7 +537,7 @@ impl CodeEditor {
 
         if cmd_or_ctrl {
             match key {
-                "s" => { self.save(); cx.notify(); return; }
+                "s" => { self.save(cx); cx.notify(); return; }
                 "z" if shift => { self.redo(); self.ensure_cursor_visible(); cx.notify(); return; }
                 "z" => { self.undo(); self.ensure_cursor_visible(); cx.notify(); return; }
                 "y" => { self.redo(); self.ensure_cursor_visible(); cx.notify(); return; }
@@ -556,15 +562,10 @@ impl CodeEditor {
             "enter" => self.newline_with_indent(),
             "tab" if shift => self.dedent(),
             "tab" => self.indent_or_tab(),
-            _ => {
-                if !cmd_or_ctrl {
-                    if let Some(c) = ks.key_char.as_deref() {
-                        if !c.is_empty() && !c.chars().any(|ch| ch.is_control()) {
-                            self.insert(c);
-                        }
-                    }
-                }
-            }
+            // Plain text input is handled by EntityInputHandler::replace_text_in_range
+            // via window.handle_input. Don't also insert here or every keystroke
+            // doubles.
+            _ => {}
         }
         self.ensure_cursor_visible();
         cx.notify();
@@ -798,6 +799,8 @@ impl CodeEditor {
 impl Focusable for CodeEditor {
     fn focus_handle(&self, _: &App) -> FocusHandle { self.focus.clone() }
 }
+
+impl EventEmitter<CodeEditorEvent> for CodeEditor {}
 
 // ---- byte / line-col helpers ----
 

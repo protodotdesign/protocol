@@ -62,7 +62,7 @@ pub fn ensure_dirs() -> Result<()> {
     Ok(())
 }
 
-pub fn load_workspaces() -> Vec<(Workspace, Option<String>)> {
+pub fn load_workspaces() -> Vec<(Workspace, PathBuf, Option<String>)> {
     let dir = workspaces_dir();
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir(&dir) else { return out };
@@ -71,11 +71,12 @@ pub fn load_workspaces() -> Vec<(Workspace, Option<String>)> {
     for path in paths {
         if path.extension().and_then(|s| s.to_str()) != Some("toml") { continue; }
         match load_workspace(&path) {
-            Ok(w) => out.push((w, None)),
+            Ok(w) => out.push((w, path, None)),
             Err(e) => {
                 let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string();
                 out.push((
                     Workspace { name, repos: vec![] },
+                    path,
                     Some(format!("{e:#}")),
                 ));
             }
@@ -101,4 +102,24 @@ pub fn save_app_state(state: &AppState) {
     if let Ok(s) = toml::to_string_pretty(state) {
         let _ = fs::write(state_path(), s);
     }
+}
+
+/// Create a new blank workspace TOML on disk. Returns the file's path so the
+/// caller can open it in the editor. Uniqueness handled by appending `-N`.
+pub fn create_blank_workspace() -> Result<PathBuf> {
+    ensure_dirs()?;
+    let dir = workspaces_dir();
+    let mut name = "new-workspace".to_string();
+    let mut path = dir.join(format!("{name}.toml"));
+    let mut n = 2;
+    while path.exists() {
+        name = format!("new-workspace-{n}");
+        path = dir.join(format!("{name}.toml"));
+        n += 1;
+    }
+    let template = format!(
+        "name = \"{name}\"\n\n# Add repos like:\n# [[repo]]\n# name = \"example\"\n# url = \"git@github.com:org/repo.git\"\n# default_branch = \"main\"\n"
+    );
+    fs::write(&path, template).with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
 }
