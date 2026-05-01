@@ -652,9 +652,166 @@ impl Protocol {
             .flex_none()
             .overflow_hidden()
             .bg(theme::panel_bg())
-            .child(self.render_workspaces_section(cx))
-            .child(self.render_instances_section(cx))
-            .child(self.render_repositories_section(cx))
+            .child(self.render_workspace_tree(cx))
+    }
+
+    fn render_workspace_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut col = div().flex().flex_col().pb_2();
+
+        // Workspace header — click cycles to the next workspace.
+        let header_label: SharedString = match self.selected_workspace.as_deref() {
+            Some(ws) => format!("[ {ws} ]").into(),
+            None => "[ no workspace ]".into(),
+        };
+        col = col.child(
+            div()
+                .id("workspace-header")
+                .flex()
+                .items_center()
+                .h(px(theme::SECTION_HEADER_H))
+                .px(px(theme::ROW_PAD_X))
+                .text_size(px(11.))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme::text_strong())
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::row_hover()))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.cycle_workspace(cx);
+                        cx.notify();
+                    }),
+                )
+                .child(header_label),
+        );
+
+        let Some(ws_name) = self.selected_workspace.clone() else {
+            col = col.child(
+                row_base()
+                    .text_color(theme::text_dim())
+                    .child(SharedString::from(format!(
+                        "drop a .toml in {}",
+                        config::workspaces_dir().display()
+                    ))),
+            );
+            return col;
+        };
+
+        // Instances of this workspace, then their repos and files (lazy-expand).
+        let inst_root = config::instances_dir().join(&ws_name);
+        let entries = {
+            let mut cache = self.dir_cache.borrow_mut();
+            cache
+                .entry(inst_root.clone())
+                .or_insert_with(|| instance::read_dir_sorted(&inst_root))
+                .clone()
+        };
+        let instance_entries: Vec<_> = entries.into_iter().filter(|e| e.is_dir).collect();
+
+        if instance_entries.is_empty() && self.creating_instance.is_none() {
+            col = col.child(
+                row_base()
+                    .text_color(theme::text_dim())
+                    .child("no instances"),
+            );
+        }
+
+        for inst in &instance_entries {
+            let inst_name = inst.name.clone();
+            let inst_path = inst.path.clone();
+            let active = self.selected_instance.as_deref() == Some(inst_name.as_str());
+            let expanded = self.expanded.contains(&inst_path);
+            let chevron = if expanded { "▾" } else { "▸" };
+            let ws_for_right = ws_name.clone();
+            let inst_for_right = inst_name.clone();
+            let inst_for_click = inst_name.clone();
+            let inst_path_for_click = inst_path.clone();
+            col = col.child(
+                row_base()
+                    .when(active, |d| d.bg(theme::row_selected()))
+                    .hover(|s| s.bg(theme::row_hover()))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .w(px(12.))
+                            .text_size(px(9.))
+                            .text_color(theme::text_dim())
+                            .child(chevron),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(if active { theme::text_strong() } else { theme::text() })
+                            .child(SharedString::from(inst_name.clone())),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.select_instance(&inst_for_click, cx);
+                            this.toggle_dir(&inst_path_for_click);
+                            this.persist();
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, _, _, cx| {
+                            this.pending_delete = Some((ws_for_right.clone(), inst_for_right.clone()));
+                            cx.notify();
+                        }),
+                    ),
+            );
+            if expanded {
+                let mut sub_rows: Vec<gpui::AnyElement> = Vec::new();
+                self.collect_tree(&inst_path, 1, &mut sub_rows, cx);
+                for r in sub_rows {
+                    col = col.child(r);
+                }
+            }
+        }
+
+        // New-instance row.
+        col = col.child(
+            row_base()
+                .id("new-instance-button")
+                .hover(|s| s.bg(theme::row_hover()))
+                .cursor_pointer()
+                .child(
+                    div()
+                        .w(px(12.))
+                        .text_color(theme::text_dim())
+                        .child("+"),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_color(theme::text_dim())
+                        .child("new instance"),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.start_create_instance();
+                        cx.notify();
+                    }),
+                ),
+        );
+        col
+    }
+
+    fn cycle_workspace(&mut self, cx: &mut Context<Self>) {
+        if self.workspaces.len() < 2 {
+            return;
+        }
+        let cur = self.selected_workspace.clone();
+        let names: Vec<String> = self.workspaces.iter().map(|(w, _)| w.name.clone()).collect();
+        let next_idx = match cur.and_then(|c| names.iter().position(|n| n == &c)) {
+            Some(i) => (i + 1) % names.len(),
+            None => 0,
+        };
+        let next = names[next_idx].clone();
+        self.select_workspace(&next, cx);
+        self.persist();
     }
 
     fn render_repositories_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
