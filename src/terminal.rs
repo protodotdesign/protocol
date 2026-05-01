@@ -17,8 +17,9 @@ use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
 use anyhow::Result;
 use futures::StreamExt;
 use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, Focusable, Hsla, IntoElement, KeyDownEvent,
-    MouseButton, Rgba, SharedString, StyledText, TextRun, Window, div, font, hsla, prelude::*, px,
+    App, AppContext, Bounds, Context, Element, Entity, FocusHandle, Focusable, GlobalElementId,
+    Hsla, InspectorElementId, IntoElement, KeyDownEvent, LayoutId, MouseButton, Pixels, Position,
+    Rgba, SharedString, Style, StyledText, TextRun, Window, div, font, hsla, prelude::*, px,
     rgb,
 };
 
@@ -163,6 +164,7 @@ impl Terminal {
         if self.size.lines == lines && self.size.cols == cols {
             return;
         }
+        let was_initial = self.size.lines == DEFAULT_LINES && self.size.cols == DEFAULT_COLS;
         self.size = GridSize { lines, cols };
         // Resize alacritty term grid.
         self.term.lock().resize(self.size);
@@ -172,6 +174,12 @@ impl Terminal {
             cell_width: cell_w,
             cell_height: cell_h,
         });
+        // After the very first true-size probe lands, ask the shell to redraw its prompt
+        // at the new dimensions. Without this, content written at the default 80x24
+        // before the probe ran stays wrapped at the wrong column.
+        if was_initial {
+            self.write(b"\x0c".to_vec()); // ctrl-L: clear-screen / redraw prompt
+        }
     }
 
     pub fn size(&self) -> GridSize { self.size }
@@ -403,6 +411,78 @@ impl Terminal {
     }
 }
 
+/// Sized to fill its parent body; in prepaint, computes how many rows/cols fit
+/// at the current font metrics and calls `Terminal::resize` so alacritty (and
+/// the underlying PTY) reflow. Without this, the shell keeps wrapping at 80 cols
+/// no matter how big the panel is.
+pub struct TermSizeProbe {
+    pub entity: Entity<Terminal>,
+}
+
+impl IntoElement for TermSizeProbe {
+    type Element = Self;
+    fn into_element(self) -> Self::Element { self }
+}
+
+impl Element for TermSizeProbe {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+    fn id(&self) -> Option<gpui::ElementId> { None }
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> { None }
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _ins: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        // Absolute + inset 0 = covers parent's padding-box without consuming flex space,
+        // so the rendered terminal lines stay visible underneath.
+        let mut style = Style::default();
+        style.position = Position::Absolute;
+        style.inset.top = px(0.).into();
+        style.inset.left = px(0.).into();
+        style.inset.right = px(0.).into();
+        style.inset.bottom = px(0.).into();
+        (window.request_layout(style, [], cx), ())
+    }
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _ins: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.entity.update(cx, |term, _| {
+            let cell_w = term.last_cell_w.max(1.);
+            let cell_h = term.last_cell_h.max(1.);
+            let cols = (bounds.size.width.as_f32() / cell_w).floor() as usize;
+            let lines = (bounds.size.height.as_f32() / cell_h).floor() as usize;
+            if std::env::var("PROTOCOL_TIMING").is_ok() {
+                eprintln!(
+                    "term probe: bounds {:.0}x{:.0}, cell {:.2}x{:.2}, grid {}x{}",
+                    bounds.size.width.as_f32(), bounds.size.height.as_f32(),
+                    cell_w, cell_h, cols, lines
+                );
+            }
+            term.resize(lines.max(1), cols.max(1), cell_w as u16, cell_h as u16);
+        });
+    }
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _ins: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+    }
+}
+
 impl Render for Terminal {
     fn render(&mut self, _w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let snapshot = self.snapshot();
@@ -437,51 +517,61 @@ impl Render for Terminal {
                     window.focus(&this.focus, cx);
                     cx.notify();
                 }),
-            );
+            )
+            .child(TermSizeProbe { entity: cx.entity() });
 
-        let mut col = div().flex().flex_col();
-        for (line_idx, line) in lines.into_iter().enumerate() {
-            let cell_h_px = px(cell_h);
-            // Row of background quads + foreground text overlay.
-            let LineRender { background_runs, runs, text } = line;
-            let mut row = div()
-                .relative()
-                .h(cell_h_px)
-                .min_w_0();
-            for bg in background_runs {
-                row = row.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left(px(bg.x))
-                        .w(px(bg.w))
-                        .h(cell_h_px)
-                        .bg(bg.color),
-                );
+        // Render every cell as an absolutely-positioned div at (col*cell_w, line*cell_h).
+        // Avoids any text-shaping kerning that would let cells drift away from the
+        // alacritty grid, which is what was causing the prompt and input to overlap.
+        let mut grid = div().relative().flex_1().min_h_0().min_w_0();
+        for (line_idx, line) in snapshot.lines.iter().enumerate() {
+            let y = line_idx as f32 * cell_h;
+            for (col_idx, cell) in line.iter().enumerate() {
+                let x = col_idx as f32 * cell_w;
+                let visible_bg = cell.bg.a > 0.05;
+                if visible_bg {
+                    grid = grid.child(
+                        div()
+                            .absolute()
+                            .top(px(y))
+                            .left(px(x))
+                            .w(px(cell_w))
+                            .h(px(cell_h))
+                            .bg(cell.bg),
+                    );
+                }
+                let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
+                if ch != ' ' {
+                    let mut s = String::with_capacity(4);
+                    s.push(ch);
+                    grid = grid.child(
+                        div()
+                            .absolute()
+                            .top(px(y))
+                            .left(px(x))
+                            .w(px(cell_w))
+                            .h(px(cell_h))
+                            .text_color(cell.fg)
+                            .child(SharedString::from(s)),
+                    );
+                }
             }
-            row = row.child(
+        }
+        if cursor_visible {
+            let cy = (cursor_line.max(0) as f32) * cell_h;
+            let cx = cursor_col as f32 * cell_w;
+            grid = grid.child(
                 div()
                     .absolute()
-                    .top_0()
-                    .left_0()
-                    .h(cell_h_px)
-                    .child(StyledText::new(text).with_runs(runs)),
+                    .top(px(cy))
+                    .left(px(cx))
+                    .w(px(cell_w))
+                    .h(px(cell_h))
+                    .bg(hsla(45. / 360., 1., 0.7, 0.5)),
             );
-            if cursor_visible && cursor_line == line_idx as i32 {
-                row = row.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left(px(cursor_col as f32 * cell_w))
-                        .w(px(cell_w))
-                        .h(cell_h_px)
-                        .bg(hsla(45. / 360., 1., 0.7, 0.5)),
-                );
-            }
-            col = col.child(row);
         }
 
-        body.child(col)
+        body.child(grid)
     }
 }
 
