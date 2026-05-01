@@ -603,8 +603,6 @@ impl Protocol {
             .h(px(theme::TITLEBAR_H))
             .w_full()
             .bg(theme::titlebar_bg())
-            .border_b_1()
-            .border_color(theme::divider())
             .pl(traffic_light_room)
             .pr_3()
             .text_size(px(12.))
@@ -954,8 +952,6 @@ impl Protocol {
             .items_center()
             .h(px(28.))
             .bg(theme::titlebar_bg())
-            .border_b_1()
-            .border_color(theme::divider())
             .text_size(px(11.5));
         if tabs.is_empty() {
             return bar.child(
@@ -1045,9 +1041,6 @@ impl Protocol {
             .items_center()
             .h(px(28.))
             .bg(theme::titlebar_bg())
-            .border_t_1()
-            .border_b_1()
-            .border_color(theme::divider())
             .text_size(px(11.5));
 
         if let (Some(_), Some(list)) = (key.clone(), terminals) {
@@ -1193,8 +1186,6 @@ impl Protocol {
             .h(px(theme::STATUSBAR_H))
             .px_3()
             .bg(theme::titlebar_bg())
-            .border_t_1()
-            .border_color(theme::divider())
             .text_size(px(10.5))
             .text_color(theme::text_muted())
             .child(div().flex_1())
@@ -1210,10 +1201,11 @@ fn resize_handle(
 ) -> impl IntoElement {
     let active = current_drag == Some(kind);
     let cursor = if vertical { CursorStyle::ResizeLeftRight } else { CursorStyle::ResizeUpDown };
-    let bg = if active { theme::accent() } else { theme::divider() };
 
-    // Outer hit region (1px footprint to keep layout flush with the panel) plus an
-    // absolutely positioned wider invisible hit area for easy grabbing.
+    // Zero-footprint divider: collapses to a 1px hit region between adjoining
+    // panels. Only paints a visible line while actively dragging; on hover the
+    // wider hit-zone gets the cursor change but stays invisible. Adjoining
+    // surfaces meet seamlessly.
     let mut outer = div()
         .relative()
         .flex_none()
@@ -1225,11 +1217,17 @@ fn resize_handle(
                 cx.notify();
             }),
         );
+    // Paint the 1px footprint with the panel surface so the divider blends into the
+    // adjoining side panel / titlebar / status bar instead of revealing the body
+    // background between regions. Active drag still highlights it.
     outer = if vertical {
-        outer.w(px(1.)).h_full().bg(bg)
+        outer.w(px(1.)).h_full().bg(theme::panel_bg())
     } else {
-        outer.h(px(1.)).w_full().bg(bg)
+        outer.h(px(1.)).w_full().bg(theme::panel_bg())
     };
+    if active {
+        outer = outer.bg(theme::accent());
+    }
     let hit = div().absolute();
     let hit = if vertical {
         hit.top_0().bottom_0().left(px(-3.)).w(px(7.))

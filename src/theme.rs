@@ -3,8 +3,12 @@ use gpui::{Hsla, Rgba, hsla, rgb};
 // Surfaces. Zed's One Dark / default-ish — pretty close to #1f2128 / #181a1f.
 pub fn bg() -> Rgba { rgb(0x1f2128) }
 pub fn panel_bg() -> Rgba { rgb(0x181a1f) }
-pub fn titlebar_bg() -> Rgba { rgb(0x14161b) }
-pub fn divider() -> Rgba { rgb(0x2a2c33) }
+// Title bar matches the side panel surface so the window chrome reads as one
+// continuous canvas with no contrast band at the top.
+pub fn titlebar_bg() -> Rgba { rgb(0x181a1f) }
+// Subtle separator that stays close to panel_bg; just enough to imply a seam
+// without leaving a visible gap-looking line between sections.
+pub fn divider() -> Rgba { rgb(0x202229) }
 
 // Selection lives on the surface, not as a tint. Slight lift, no hue.
 pub fn row_hover() -> Hsla { hsla(0., 0., 1., 0.035) }
