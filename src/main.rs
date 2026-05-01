@@ -519,9 +519,9 @@ impl Focusable for Protocol {
 }
 
 impl Render for Protocol {
-    fn render(&mut self, _w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = std::time::Instant::now();
-        let body = self.render_body(cx);
+        let body = self.render_body(window, cx);
         if std::env::var("PROTOCOL_TIMING").is_ok() {
             let ms = t.elapsed().as_secs_f64() * 1000.;
             if ms > 0.5 {
@@ -610,7 +610,7 @@ impl Protocol {
             .child(SharedString::from(crumb))
     }
 
-    fn render_body(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_body(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         let layout = self.current_layout();
         let center = div()
             .flex()
@@ -618,11 +618,11 @@ impl Protocol {
             .flex_1()
             .min_w_0()
             .min_h_0()
-            .child(self.render_main(cx));
+            .child(self.render_main(window, cx));
         let center = if layout.terminal_panel_pos == PanelPos::Bottom {
             center
                 .child(resize_handle(DragKind::TerminalPanel, false, self.drag, cx))
-                .child(self.render_terminal_panel(cx))
+                .child(self.render_terminal_panel(window, cx))
         } else {
             center
         };
@@ -638,7 +638,7 @@ impl Protocol {
         if layout.terminal_panel_pos == PanelPos::Right {
             row = row
                 .child(resize_handle(DragKind::TerminalPanel, true, self.drag, cx))
-                .child(self.render_terminal_panel(cx));
+                .child(self.render_terminal_panel(window, cx));
         }
         row
     }
@@ -897,8 +897,18 @@ impl Protocol {
         col
     }
 
-    fn render_main(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let outer = div().flex().flex_col().flex_1().min_h_0().min_w_0();
+    fn render_main(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let editor_focused = self
+            .active_editor_entity()
+            .map(|e| e.read(cx).focus.is_focused(window))
+            .unwrap_or(false);
+        let outer = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .relative();
         let inst_dir = self.active_instance_path();
         let tabs: Vec<(PathBuf, bool, bool)> = self
             .editors
@@ -937,7 +947,11 @@ impl Protocol {
             placeholder("no file selected").into_any_element()
         };
 
-        outer.child(tab_bar).child(body)
+        let mut wrapper = outer.child(tab_bar).child(body);
+        if editor_focused {
+            wrapper = wrapper.child(focus_overlay());
+        }
+        wrapper
     }
 
     fn render_tab_bar(
@@ -1025,7 +1039,11 @@ impl Protocol {
         bar
     }
 
-    fn render_terminal_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_terminal_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let term_focused = self
+            .active_terminal_entity()
+            .map(|t| t.read(cx).focus.is_focused(window))
+            .unwrap_or(false);
         let key = self.active_instance_key();
         let terminals = key.as_ref().and_then(|k| self.terminals.get(k));
         let terminal_count = terminals.map(|v| v.len()).unwrap_or(0);
@@ -1165,12 +1183,21 @@ impl Protocol {
         };
 
         let layout = self.current_layout();
-        let outer = div().flex().flex_col().flex_none().overflow_hidden();
+        let outer = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .relative()
+            .overflow_hidden();
         let outer = match layout.terminal_panel_pos {
             PanelPos::Bottom => outer.h(px(layout.terminal_panel_size)).w_full(),
             PanelPos::Right => outer.w(px(layout.terminal_panel_size)),
         };
-        outer.child(tabs).child(body)
+        let mut wrapper = outer.child(tabs).child(body);
+        if term_focused {
+            wrapper = wrapper.child(focus_overlay());
+        }
+        wrapper
     }
 
     fn render_status(&self) -> impl IntoElement {
@@ -1217,24 +1244,46 @@ fn resize_handle(
                 cx.notify();
             }),
         );
-    // Paint the 1px footprint with the panel surface so the divider blends into the
-    // adjoining side panel / titlebar / status bar instead of revealing the body
-    // background between regions. Active drag still highlights it.
+    // Zero-width footprint: regions abut each other directly, so no background-color
+    // gap shows through between them. Drag still works because we expand the hit
+    // zone with an absolutely-positioned overlay that straddles the (invisible) line.
+    // While actively dragging, draw a 1px accent overlay so the user can see where
+    // the divider sits.
     outer = if vertical {
-        outer.w(px(1.)).h_full().bg(theme::panel_bg())
+        outer.w(px(0.)).h_full()
     } else {
-        outer.h(px(1.)).w_full().bg(theme::panel_bg())
+        outer.h(px(0.)).w_full()
     };
-    if active {
-        outer = outer.bg(theme::accent());
-    }
     let hit = div().absolute();
     let hit = if vertical {
         hit.top_0().bottom_0().left(px(-3.)).w(px(7.))
     } else {
         hit.left_0().right_0().top(px(-3.)).h(px(7.))
     };
-    outer.child(hit)
+    let mut wrapper = outer.child(hit);
+    if active {
+        let stroke = div().absolute();
+        let stroke = if vertical {
+            stroke.top_0().bottom_0().left(px(0.)).w(px(1.)).bg(theme::accent())
+        } else {
+            stroke.left_0().right_0().top(px(0.)).h(px(1.)).bg(theme::accent())
+        };
+        wrapper = wrapper.child(stroke);
+    }
+    wrapper
+}
+
+/// 1px accent ring drawn as an absolutely-positioned overlay so it doesn't
+/// reserve any layout space when not present.
+fn focus_overlay() -> gpui::Div {
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .border_1()
+        .border_color(gpui::hsla(220. / 360., 0.6, 0.6, 0.25))
 }
 
 fn placeholder(text: &'static str) -> gpui::Div {
