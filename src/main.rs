@@ -53,16 +53,22 @@ struct OpenEditor {
 #[derive(Clone, Copy, Debug)]
 struct Layout {
     left_panel_w: f32,
+    right_panel_w: f32,
     terminal_panel_size: f32,
     terminal_panel_pos: PanelPos,
+    left_collapsed: bool,
+    right_collapsed: bool,
 }
 
 impl Default for Layout {
     fn default() -> Self {
         Self {
             left_panel_w: theme::PANEL_W,
+            right_panel_w: theme::PANEL_W,
             terminal_panel_size: 280.,
             terminal_panel_pos: PanelPos::Bottom,
+            left_collapsed: false,
+            right_collapsed: false,
         }
     }
 }
@@ -76,6 +82,7 @@ enum PanelPos {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DragKind {
     LeftPanel,
+    RightPanel,
     TerminalPanel,
     /// User is dragging the terminal panel's reposition handle. Tracks the
     /// current pointer position so we can decide which dock to snap to on drop.
@@ -117,8 +124,11 @@ impl Protocol {
                 (layout.workspace.clone(), layout.instance.clone()),
                 Layout {
                     left_panel_w: layout.left_panel_w,
+                    right_panel_w: layout.right_panel_w,
                     terminal_panel_size: layout.terminal_panel_size,
                     terminal_panel_pos: pos,
+                    left_collapsed: layout.left_collapsed,
+                    right_collapsed: layout.right_collapsed,
                 },
             );
         }
@@ -188,11 +198,14 @@ impl Protocol {
                 workspace: ws.clone(),
                 instance: inst.clone(),
                 left_panel_w: l.left_panel_w,
+                right_panel_w: l.right_panel_w,
                 terminal_panel_size: l.terminal_panel_size,
                 terminal_panel_pos: match l.terminal_panel_pos {
                     PanelPos::Bottom => "bottom".into(),
                     PanelPos::Right => "right".into(),
                 },
+                left_collapsed: l.left_collapsed,
+                right_collapsed: l.right_collapsed,
             })
             .collect();
         config::save_app_state(&config::AppState {
@@ -304,6 +317,10 @@ impl Protocol {
             DragKind::LeftPanel => {
                 let w = x.clamp(140., (win_w - 240.).max(140.));
                 self.mutate_layout(|l| l.left_panel_w = w);
+            }
+            DragKind::RightPanel => {
+                let w = (win_w - x).clamp(140., (win_w - current.left_panel_w - 200.).max(140.));
+                self.mutate_layout(|l| l.right_panel_w = w);
             }
             DragKind::TerminalPanel => match current.terminal_panel_pos {
                 PanelPos::Bottom => {
@@ -544,7 +561,7 @@ impl Render for Protocol {
             .text_color(theme::text())
             .font_family(".SystemUIFont")
             .text_size(px(13.))
-            .child(self.render_titlebar())
+            .child(self.render_titlebar(cx))
             .child(body)
             .child(self.render_status());
 
@@ -590,8 +607,9 @@ fn row_base() -> gpui::Div {
 }
 
 impl Protocol {
-    fn render_titlebar(&self) -> impl IntoElement {
+    fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let traffic_light_room = px(76.);
+        let layout = self.current_layout();
         let mut crumb = String::from("Protocol");
         if let Some(ws) = &self.selected_workspace {
             crumb = format!("Protocol  ›  {ws}");
@@ -606,43 +624,152 @@ impl Protocol {
             .w_full()
             .bg(theme::titlebar_bg())
             .pl(traffic_light_room)
-            .pr_3()
+            .pr_2()
             .text_size(px(12.))
             .text_color(theme::text_strong())
-            .child(SharedString::from(crumb))
+            .child(sidebar_toggle_button(
+                "tb-left",
+                if layout.left_collapsed { "▶" } else { "◀" },
+                cx.listener(|this, _, _, cx| {
+                    this.mutate_layout(|l| l.left_collapsed = !l.left_collapsed);
+                    cx.notify();
+                }),
+            ))
+            .child(div().w_2())
+            .child(div().flex_1().child(SharedString::from(crumb)))
+            .child(sidebar_toggle_button(
+                "tb-right",
+                if layout.right_collapsed { "◀" } else { "▶" },
+                cx.listener(|this, _, _, cx| {
+                    this.mutate_layout(|l| l.right_collapsed = !l.right_collapsed);
+                    cx.notify();
+                }),
+            ))
     }
 
     fn render_body(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         let layout = self.current_layout();
-        let center = div()
-            .flex()
-            .flex_col()
+        // Editor + terminal live INSIDE the same center card regardless of dock
+        // direction so we get one rounded-card frame with an internal split seam,
+        // not two separate cards.
+        let r = px(6.);
+        let center_inner = match layout.terminal_panel_pos {
+            PanelPos::Bottom => div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .child(
+                    // Editor occupies the top half — round only the top corners
+                    // so its square bottom edge can't bleed past the card's clip.
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .rounded_tl(r)
+                        .rounded_tr(r)
+                        .overflow_hidden()
+                        .child(self.render_main(window, cx)),
+                )
+                .child(resize_handle(DragKind::TerminalPanel, false, self.drag, cx))
+                .child(self.render_terminal_panel(window, cx)),
+            PanelPos::Right => div()
+                .flex()
+                .flex_row()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .child(
+                    // Editor on the left — only top-left and bottom-left round.
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .rounded_tl(r)
+                        .rounded_bl(r)
+                        .overflow_hidden()
+                        .child(self.render_main(window, cx)),
+                )
+                .child(resize_handle(DragKind::TerminalPanel, true, self.drag, cx))
+                .child(self.render_terminal_panel(window, cx)),
+        };
+        let center = card_frame()
             .flex_1()
             .min_w_0()
             .min_h_0()
-            .child(self.render_main(window, cx));
-        let center = if layout.terminal_panel_pos == PanelPos::Bottom {
-            center
-                .child(resize_handle(DragKind::TerminalPanel, false, self.drag, cx))
-                .child(self.render_terminal_panel(window, cx))
-        } else {
-            center
-        };
+            .child(center_inner);
 
         let mut row = div()
             .flex()
             .flex_row()
             .flex_1()
             .min_h_0()
-            .child(self.render_left(cx))
-            .child(resize_handle(DragKind::LeftPanel, true, self.drag, cx))
-            .child(center);
-        if layout.terminal_panel_pos == PanelPos::Right {
+            // Behind the rounded center card, paint the same surface as the
+            // sidebars. Otherwise the editor/terminal bg matches the body bg
+            // and the rounded corners read as invisible.
+            .bg(theme::panel_bg());
+        if !layout.left_collapsed {
             row = row
-                .child(resize_handle(DragKind::TerminalPanel, true, self.drag, cx))
-                .child(self.render_terminal_panel(window, cx));
+                .child(self.render_left(cx))
+                .child(resize_handle(DragKind::LeftPanel, true, self.drag, cx));
+        }
+        row = row.child(center);
+        if !layout.right_collapsed {
+            row = row
+                .child(resize_handle(DragKind::RightPanel, true, self.drag, cx))
+                .child(self.render_right(cx));
         }
         row
+    }
+
+    fn render_right(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let layout = self.current_layout();
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .w(px(layout.right_panel_w))
+            .flex_none()
+            .overflow_hidden()
+            .bg(theme::panel_bg());
+        // Header.
+        col = col.child(
+            div()
+                .flex()
+                .items_center()
+                .h(px(theme::SECTION_HEADER_H + 4.))
+                .px(px(theme::ROW_PAD_X))
+                .text_size(px(11.5))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme::text_muted())
+                .child("FILES"),
+        );
+        if let Some(root) = self.active_instance_path() {
+            if !root.exists() {
+                col = col.child(
+                    row_base()
+                        .text_color(theme::text_dim())
+                        .child("instance dir missing"),
+                );
+                return col;
+            }
+            let mut rows: Vec<gpui::AnyElement> = Vec::new();
+            self.collect_tree(&root, 0, &mut rows, cx);
+            for r in rows {
+                col = col.child(r);
+            }
+        } else {
+            col = col.child(
+                row_base()
+                    .text_color(theme::text_dim())
+                    .child("no instance selected"),
+            );
+        }
+        col
     }
 
     fn render_left(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -785,16 +912,12 @@ impl Protocol {
                 let inst_for_right = inst_name.clone();
                 let inst_for_click = inst_name.clone();
                 let inst_path_for_click = inst_path.clone();
+                let _ = (expanded, chevron, inst_path_for_click); // file tree lives in the right sidebar now
                 col = col.child(
-                    // Top-level instance entries get their own visual tier: tall card
-                    // with generous vertical padding and a heavier label, distinct from
-                    // the dense file/repo rows underneath. Active gets a subtle 1px
-                    // accent border to highlight the rounded card.
                     div()
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap_2()
                         .h(px(48.))
                         .mx(px(4.))
                         .my(px(2.))
@@ -813,13 +936,6 @@ impl Protocol {
                         .cursor_pointer()
                         .child(
                             div()
-                                .w(px(12.))
-                                .text_size(px(9.5))
-                                .text_color(theme::text_dim())
-                                .child(chevron),
-                        )
-                        .child(
-                            div()
                                 .flex_1()
                                 .text_color(if active { theme::text_strong() } else { theme::text() })
                                 .child(SharedString::from(inst_name.clone())),
@@ -831,7 +947,6 @@ impl Protocol {
                                     this.select_workspace(&ws_for_select, cx);
                                 }
                                 this.select_instance(&inst_for_click, cx);
-                                this.toggle_dir(&inst_path_for_click);
                                 this.persist();
                                 cx.notify();
                             }),
@@ -844,13 +959,6 @@ impl Protocol {
                             }),
                         ),
                 );
-                if expanded {
-                    let mut sub_rows: Vec<gpui::AnyElement> = Vec::new();
-                    self.collect_tree(&inst_path, 2, &mut sub_rows, cx);
-                    for r in sub_rows {
-                        col = col.child(r);
-                    }
-                }
             }
 
         }
@@ -1367,6 +1475,9 @@ impl Protocol {
                 .justify_center()
                 .flex_1()
                 .min_h_0()
+                // Match an open terminal's bg so the empty panel reads as a
+                // terminal area, not as continuation of the editor surface.
+                .bg(gpui::rgb(0x12141a))
                 .text_color(theme::text_dim())
                 .text_size(px(11.5))
                 .child("no terminals — click + to start one")
@@ -1379,7 +1490,7 @@ impl Protocol {
                 .child(active)
                 .into_any_element()
         } else {
-            div().flex_1().min_h_0().into_any_element()
+            div().flex_1().min_h_0().bg(gpui::rgb(0x12141a)).into_any_element()
         };
 
         let layout = self.current_layout();
@@ -1420,6 +1531,44 @@ impl Protocol {
     }
 }
 
+/// 1px subtle border + 6px corner radius + 1px inset, with content clipping.
+/// The card paints its own bg matching the editor body's syntect theme bg, so
+/// any antialiased pixels at the rounded corners blend with the card's own
+/// fill instead of bleeding the editor color past the clip.
+fn card_frame() -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .my(px(1.))
+        .mx(px(1.))
+        .rounded(px(6.))
+        .border_1()
+        .border_color(theme::divider())
+        .bg(highlight::theme_bg())
+        .overflow_hidden()
+}
+
+fn sidebar_toggle_button(
+    id: &'static str,
+    glyph: &'static str,
+    handler: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(24.))
+        .h(px(22.))
+        .rounded(px(4.))
+        .text_size(px(11.))
+        .text_color(theme::text_muted())
+        .cursor_pointer()
+        .hover(|s| s.bg(theme::row_hover()).text_color(theme::text()))
+        .on_mouse_down(MouseButton::Left, handler)
+        .child(glyph)
+}
+
 fn resize_handle(
     kind: DragKind,
     vertical: bool,
@@ -1428,15 +1577,22 @@ fn resize_handle(
 ) -> impl IntoElement {
     let active = current_drag == Some(kind);
     let cursor = if vertical { CursorStyle::ResizeLeftRight } else { CursorStyle::ResizeUpDown };
+    let id_str: SharedString = format!("resize:{:?}:{}", kind, vertical).into();
 
-    // Zero-footprint divider: collapses to a 1px hit region between adjoining
-    // panels. Only paints a visible line while actively dragging; on hover the
-    // wider hit-zone gets the cursor change but stays invisible. Adjoining
-    // surfaces meet seamlessly.
-    let mut outer = div()
-        .relative()
-        .flex_none()
+    // Zero-width layout slot. The actual interactive area is an absolutely
+    // positioned 7px-wide hit zone owning the cursor + click handler so users
+    // can grab it without precision aiming. Surfaces still abut seamlessly.
+    let outer = div().relative().flex_none();
+    let outer = if vertical {
+        outer.w(px(0.)).h_full()
+    } else {
+        outer.h(px(0.)).w_full()
+    };
+    let hit = div()
+        .id(id_str)
+        .absolute()
         .cursor(cursor)
+        .hover(|s| s.bg(gpui::hsla(220. / 360., 0.6, 0.6, 0.18)))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _ev, _w, cx| {
@@ -1444,17 +1600,6 @@ fn resize_handle(
                 cx.notify();
             }),
         );
-    // Zero-width footprint: regions abut each other directly, so no background-color
-    // gap shows through between them. Drag still works because we expand the hit
-    // zone with an absolutely-positioned overlay that straddles the (invisible) line.
-    // While actively dragging, draw a 1px accent overlay so the user can see where
-    // the divider sits.
-    outer = if vertical {
-        outer.w(px(0.)).h_full()
-    } else {
-        outer.h(px(0.)).w_full()
-    };
-    let hit = div().absolute();
     let hit = if vertical {
         hit.top_0().bottom_0().left(px(-3.)).w(px(7.))
     } else {

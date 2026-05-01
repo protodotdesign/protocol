@@ -33,10 +33,18 @@ pub struct InstanceLayout {
     pub workspace: String,
     pub instance: String,
     pub left_panel_w: f32,
+    #[serde(default = "default_right_panel_w")]
+    pub right_panel_w: f32,
     pub terminal_panel_size: f32,
     /// "bottom" or "right".
     pub terminal_panel_pos: String,
+    #[serde(default)]
+    pub left_collapsed: bool,
+    #[serde(default)]
+    pub right_collapsed: bool,
 }
+
+fn default_right_panel_w() -> f32 { 240. }
 
 pub fn protocol_root() -> PathBuf {
     dirs::home_dir()

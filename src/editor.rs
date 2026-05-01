@@ -1104,10 +1104,8 @@ impl Element for EditorElement {
         cx: &mut App,
     ) {
         let paint_start = std::time::Instant::now();
-        let bg = highlight::theme_bg();
-        let panel_bg = bg;
-        // Paint background for whole element.
-        window.paint_quad(fill(prepaint.bounds, panel_bg));
+        // No bg fill here — the parent card paints its own bg, which is the same
+        // color and (unlike a square paint_quad) respects the rounded card mask.
 
         let line_h = px(LINE_H);
         let body = prepaint.body_bounds;
@@ -1168,7 +1166,7 @@ impl Element for EditorElement {
                     prepaint.bounds.origin.y + prepaint.bounds.size.height,
                 ),
             ),
-            panel_bg,
+            highlight::theme_bg(),
         ));
         for (i, shaped) in prepaint.gutter_lines.iter().enumerate() {
             let line_idx = prepaint.visible_start + i;
@@ -1312,7 +1310,6 @@ fn paint_selection(
 
 impl Render for CodeEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let bg = highlight::theme_bg();
         let entity = cx.entity();
         div()
             .id("code-editor")
@@ -1324,7 +1321,6 @@ impl Render for CodeEditor {
             .min_h_0()
             .min_w_0()
             .overflow_hidden()
-            .bg(bg)
             .on_scroll_wheel(cx.listener(move |this, ev: &gpui::ScrollWheelEvent, _, cx| {
                 let (dx, dy) = match ev.delta {
                     gpui::ScrollDelta::Pixels(p) => (p.x.as_f32(), p.y.as_f32()),

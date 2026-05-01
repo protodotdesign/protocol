@@ -502,9 +502,7 @@ impl Render for Terminal {
             .min_h_0()
             .min_w_0()
             .overflow_hidden()
-            // Match the editor body color so the terminal panel doesn't look like
-            // a darker hole next to the editor when they sit side-by-side.
-            .bg(rgb(0x1f2128))
+            .bg(rgb(0x12141a))
             .px_2()
             .py_1()
             .font_family(TERM_FONT_FAMILY)
