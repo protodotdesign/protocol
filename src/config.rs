@@ -6,8 +6,30 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
     pub name: String,
+    /// Optional SSH private key used for git operations on every repo in this
+    /// workspace. Path is expanded with `~` shorthand. When set we invoke git
+    /// with `GIT_SSH_COMMAND="ssh -i <key> -o IdentitiesOnly=yes"` so it
+    /// doesn't fall through to whichever key ssh-agent serves first.
+    #[serde(default)]
+    pub ssh_key: Option<PathBuf>,
     #[serde(rename = "repo", default)]
     pub repos: Vec<Repo>,
+}
+
+impl Workspace {
+    /// Resolve `ssh_key` with `~` expansion, returning the absolute path the
+    /// caller should hand to `ssh -i`.
+    pub fn resolved_ssh_key(&self) -> Option<PathBuf> {
+        let key = self.ssh_key.as_ref()?;
+        let s = key.to_string_lossy();
+        if let Some(rest) = s.strip_prefix("~/") {
+            return dirs::home_dir().map(|h| h.join(rest));
+        }
+        if s.as_ref() == "~" {
+            return dirs::home_dir();
+        }
+        Some(key.clone())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,7 +97,7 @@ pub fn load_workspaces() -> Vec<(Workspace, PathBuf, Option<String>)> {
             Err(e) => {
                 let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string();
                 out.push((
-                    Workspace { name, repos: vec![] },
+                    Workspace { name, ssh_key: None, repos: vec![] },
                     path,
                     Some(format!("{e:#}")),
                 ));
@@ -118,7 +140,17 @@ pub fn create_blank_workspace() -> Result<PathBuf> {
         n += 1;
     }
     let template = format!(
-        "name = \"{name}\"\n\n# Add repos like:\n# [[repo]]\n# name = \"example\"\n# url = \"git@github.com:org/repo.git\"\n# default_branch = \"main\"\n"
+        "name = \"{name}\"\n\
+         \n\
+         # Optional: SSH key used for every git operation in this workspace.\n\
+         # Path supports ~ shorthand. Comment out to fall through to ssh-agent.\n\
+         # ssh_key = \"~/.ssh/id_ed25519\"\n\
+         \n\
+         # Add repos like:\n\
+         # [[repo]]\n\
+         # name = \"example\"\n\
+         # url = \"git@github.com:org/repo.git\"\n\
+         # default_branch = \"main\"\n"
     );
     fs::write(&path, template).with_context(|| format!("write {}", path.display()))?;
     Ok(path)

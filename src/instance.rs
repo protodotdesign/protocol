@@ -45,11 +45,21 @@ pub fn create_instance(workspace: &Workspace, name: &str) -> Result<()> {
         return Err(anyhow!("instance '{name}' already exists"));
     }
     fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
+    let ssh_command = workspace.resolved_ssh_key().map(|key| {
+        format!(
+            "ssh -i {} -o IdentitiesOnly=yes",
+            shell_quote(&key.to_string_lossy()),
+        )
+    });
     for repo in &workspace.repos {
         let target = dir.join(&repo.name);
-        let status = Command::new("git")
-            .args(["clone", "--branch", &repo.default_branch, "--single-branch", &repo.url])
-            .arg(&target)
+        let mut cmd = Command::new("git");
+        cmd.args(["clone", "--branch", &repo.default_branch, "--single-branch", &repo.url])
+            .arg(&target);
+        if let Some(ref s) = ssh_command {
+            cmd.env("GIT_SSH_COMMAND", s);
+        }
+        let status = cmd
             .status()
             .with_context(|| format!("spawn git clone for {}", repo.name))?;
         if !status.success() {
@@ -57,6 +67,12 @@ pub fn create_instance(workspace: &Workspace, name: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Single-quote a path for inclusion in GIT_SSH_COMMAND. Doubles single quotes
+/// the POSIX way ('\'').
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 pub fn delete_instance(workspace: &str, name: &str) -> Result<()> {
